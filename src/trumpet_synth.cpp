@@ -141,10 +141,16 @@ static double perf_counter() {
 // ─────────────────────── OUTPUT CALLBACK ──────────────────────────────────
 static int output_callback(
     const void*, void* output, unsigned long frames,
-    const PaStreamCallbackTimeInfo*, PaStreamCallbackFlags, void* userData)
+    const PaStreamCallbackTimeInfo*, PaStreamCallbackFlags statusFlags, void* userData)
 {
     auto* st  = static_cast<OutputState*>(userData);
     auto* out = static_cast<float*>(output);
+
+    // Diagnostic: if this prints "X" while you hear crackle, the crackle is
+    // buffer underruns (CPU can't keep up at this block size), NOT synthesis.
+    // In that case raise OUT_BLOCK (e.g. 256) to give more headroom. Remove
+    // this line once diagnosed.
+    if (statusFlags & paOutputUnderflow) { std::fputc('X', stderr); std::fflush(stderr); }
 
     const double target   = get_target();
     const double dyn_targ = g_dyn_gain.load(std::memory_order_relaxed);
@@ -222,6 +228,36 @@ static int input_callback(
     double pitch = static_cast<double>(st->out_buf->data[0]);
     double conf  = static_cast<double>(aubio_pitch_get_confidence(st->pitch_obj));
 
+    // ── Pitch stabilisation ───────────────────────────────────────────────
+    // On a distorted in-bell signal, aubio's estimate can jump to an octave
+    // (or fifth) of the true note for a hop or two, even on a held note. Those
+    // brief jumps make the synth lurch in frequency — heard as a gritty crackle
+    // while the average pitch still sounds steady. We reject a new estimate that
+    // is suspiciously close to 2x/0.5x (octave) or wildly far from the last
+    // stable pitch, unless it persists. This keeps the target rock-steady.
+    static double stable_pitch = 0.0;
+    static int    jump_count   = 0;
+    if (pitch > 0.0 && conf > CONF_DETECT) {
+        bool accept = true;
+        if (stable_pitch > 0.0) {
+            double ratio = pitch / stable_pitch;
+            // Treat near-octave and near-half jumps, or >7% sudden deviations,
+            // as suspect. Require 3 consecutive hops agreeing before accepting,
+            // so a real new note still comes through quickly (~17 ms) but a
+            // one-hop glitch is ignored.
+            bool octave_jump = (ratio > 1.8 && ratio < 2.2) ||
+                               (ratio > 0.45 && ratio < 0.55);
+            bool big_jump    = (ratio > 1.07 || ratio < 0.93);
+            if (octave_jump || big_jump) {
+                if (++jump_count < 3) accept = false;  // hold off, likely glitch
+            } else {
+                jump_count = 0;
+            }
+        }
+        if (accept) { stable_pitch = pitch; jump_count = 0; }
+    }
+    double use_pitch = stable_pitch;
+
     // Level in dBFS (this hop).
     double rms = 0.0;
     for (unsigned long i = 0; i < n; ++i) rms += (double)in[i] * in[i];
@@ -239,8 +275,8 @@ static int input_callback(
                      std::memory_order_relaxed);
 
     // Gate.
-    if (conf > CONF_DETECT && pitch > 0.0) {
-        st->last_pitch     = pitch;
+    if (use_pitch > 0.0) {
+        st->last_pitch     = use_pitch;
         st->last_good_time = now;
     }
     bool held = (now - st->last_good_time) < HOLD_TIME;
