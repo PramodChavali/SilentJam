@@ -48,7 +48,7 @@
 //  SETTINGS
 // ──────────────────────────────────────────────
 static constexpr int    SR            = 44100;
-static constexpr int    BUFFER_SIZE   = 1024;
+static constexpr int    BUFFER_SIZE   = 512;   // 512@44100=11.6ms window, enough for trumpet lowest note ~120Hz
 static constexpr int    HOP_SIZE      = 128;
 static constexpr int    INPUT_DEVICE  = 1;   // USB PnP mic
 static constexpr int    OUTPUT_DEVICE = 0;   // bcm2835 headphones
@@ -253,8 +253,22 @@ static int input_callback(
     cb_time += (double)HOP_SIZE / SR;
 
     if (conf > CONF_THRESHOLD && pitch > 0 && pitch < 2000.0f) {
-        g_last_pitch.store((double)pitch, std::memory_order_relaxed);
-        g_last_good_ts.store(cb_time,     std::memory_order_relaxed);
+        // Stabiliser: reject one-hop glitches and octave jumps.
+        static float stable    = 0.0f;
+        static float candidate = 0.0f;
+        static int   agree     = 0;
+        float ratio = (stable > 0.0f) ? pitch / stable : 1.0f;
+        bool is_octave = (ratio > 1.8f && ratio < 2.2f) || (ratio > 0.45f && ratio < 0.55f);
+        bool is_jump   = (ratio > 1.07f || ratio < 0.93f);
+        int  needed    = is_octave ? 3 : (is_jump ? 2 : 1);
+        if (fabsf(pitch - candidate) / (candidate + 1.0f) < 0.07f)
+            agree++;
+        else { candidate = pitch; agree = 1; }
+        if (agree >= needed) {
+            stable = pitch;
+            g_last_pitch.store((double)stable, std::memory_order_relaxed);
+            g_last_good_ts.store(cb_time, std::memory_order_relaxed);
+        }
     }
     bool pitch_valid = (cb_time - g_last_good_ts.load(std::memory_order_relaxed)) < HOLD_TIME_S;
     bool gate_open   = (conf > PLAY_CONF_THRESHOLD) && (db > PLAY_LEVEL_DB) && pitch_valid;
@@ -403,7 +417,7 @@ static void button_thread_fn() {
 // ──────────────────────────────────────────────
 int main(int argc, char* argv[])
 {
-    const char* method = (argc > 1) ? argv[1] : "yinfast";
+    const char* method = (argc > 1) ? argv[1] : "schmitt";
 
     std::cout << "silent_jam  (v5 synth + recording + pigpio button)\n"
               << "Pitch method: " << method << "  |  SR: " << SR << " Hz\n\n";
@@ -444,13 +458,13 @@ int main(int argc, char* argv[])
     inParams.device           = INPUT_DEVICE;
     inParams.channelCount     = 1;
     inParams.sampleFormat     = paFloat32;
-    inParams.suggestedLatency = Pa_GetDeviceInfo(INPUT_DEVICE)->defaultLowInputLatency;
+    inParams.suggestedLatency = 0;  // request absolute minimum
 
     PaStreamParameters outParams{};
     outParams.device           = OUTPUT_DEVICE;
     outParams.channelCount     = 2;
     outParams.sampleFormat     = paFloat32;
-    outParams.suggestedLatency = Pa_GetDeviceInfo(OUTPUT_DEVICE)->defaultLowOutputLatency;
+    outParams.suggestedLatency = 0;  // request absolute minimum
 
     PaStream* inStream = nullptr, *outStream = nullptr;
 
