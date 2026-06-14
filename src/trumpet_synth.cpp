@@ -42,7 +42,15 @@
 #include <iostream>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
+
+// GPIO button support (Raspberry Pi). Compile with -DUSE_GPIO_BUTTON and link
+// against libgpiod (-lgpiod). On non-Pi builds, leave the flag off and the
+// button code is excluded so the file still compiles anywhere.
+#ifdef USE_GPIO_BUTTON
+#  include <gpiod.h>
+#endif
 
 #ifndef M_PI
 #  define M_PI 3.14159265358979323846
@@ -59,6 +67,12 @@ static constexpr int    BUFFER_SIZE   = 1024;   // analysis window — 1024 keep
 static constexpr int    HOP_SIZE      = 128;    // keep small for latency
 static constexpr int    INPUT_DEVICE  = 1;
 static constexpr int    OUTPUT_DEVICE = 0;
+
+// GPIO button (Raspberry Pi). Button wired across 3.3V and GPIO17; internal
+// pull-down enabled in software, so press = HIGH, rising edge = toggle record.
+static constexpr int    BUTTON_GPIO_CHIP_LINE = 17;     // BCM GPIO17 (phys pin 11)
+static constexpr int    BUTTON_DEBOUNCE_MS    = 40;     // ignore bounces within this
+static constexpr const char* BUTTON_GPIO_CHIP = "gpiochip0";  // Pi 4B main bank
 
 // Gate (kept from v4)
 static constexpr float  CONF_THRESHOLD      = 0.5f;
@@ -106,6 +120,13 @@ static std::atomic<double> g_last_pitch   {0.0};
 static std::atomic<bool>   g_is_recording{false};
 static std::mutex          g_chunks_mutex;
 static std::vector<float>  g_recorded_chunks;   // mono, one sample per frame
+
+// Set by the GPIO button thread on a clean press; the main loop polls it and
+// calls toggle_recording() on the normal thread (so file I/O never runs inside
+// the button thread's event context).
+static std::atomic<bool>   g_button_toggle_requested{false};
+// Tells the button thread to exit cleanly on shutdown.
+static std::atomic<bool>   g_running{true};
 
 // ──────────────────────────────────────────────
 //  TELEMETRY
@@ -421,6 +442,70 @@ static int output_callback(
 }
 
 // ──────────────────────────────────────────────
+//  GPIO BUTTON THREAD  (Raspberry Pi, libgpiod v1.x)
+// ──────────────────────────────────────────────
+// Blocks waiting for rising edges on GPIO17 (press = HIGH thanks to the
+// internal pull-down). Debounces in software, then sets a flag the main loop
+// acts on. Uses zero CPU while waiting. Excluded unless -DUSE_GPIO_BUTTON.
+#ifdef USE_GPIO_BUTTON
+static void button_thread_fn() {
+    gpiod_chip* chip = gpiod_chip_open_by_name(BUTTON_GPIO_CHIP);
+    if (!chip) {
+        std::fprintf(stderr, "[BTN] Could not open %s — button disabled. "
+                             "Console controls still work.\n", BUTTON_GPIO_CHIP);
+        return;
+    }
+    gpiod_line* line = gpiod_chip_get_line(chip, BUTTON_GPIO_CHIP_LINE);
+    if (!line) {
+        std::fprintf(stderr, "[BTN] Could not get GPIO%d — button disabled.\n",
+                     BUTTON_GPIO_CHIP_LINE);
+        gpiod_chip_close(chip);
+        return;
+    }
+
+    // Request rising-edge events with the internal pull-down enabled.
+    gpiod_line_request_config cfg{};
+    cfg.consumer    = "silent_jam";
+    cfg.request_type = GPIOD_LINE_REQUEST_EVENT_RISING_EDGE;
+    cfg.flags       = GPIOD_LINE_REQUEST_FLAG_BIAS_PULL_DOWN;
+    if (gpiod_line_request(line, &cfg, 0) < 0) {
+        std::fprintf(stderr, "[BTN] Failed to request GPIO%d events "
+                             "(need permission? try running with sudo, or add "
+                             "your user to the 'gpio' group). Button disabled.\n",
+                     BUTTON_GPIO_CHIP_LINE);
+        gpiod_chip_close(chip);
+        return;
+    }
+
+    std::printf("[BTN] Button ready on GPIO%d — press to start/stop recording.\n",
+                BUTTON_GPIO_CHIP_LINE);
+
+    double last_press_ts = 0.0;
+    while (g_running.load()) {
+        // Wait up to 200 ms for an edge, then loop so we can check g_running.
+        timespec timeout{0, 200 * 1000 * 1000};
+        int rv = gpiod_line_event_wait(line, &timeout);
+        if (rv < 0) break;        // error
+        if (rv == 0) continue;    // timeout, just re-check g_running
+
+        gpiod_line_event ev;
+        if (gpiod_line_event_read(line, &ev) < 0) continue;
+
+        // Software debounce: ignore edges within BUTTON_DEBOUNCE_MS of the last.
+        double now = (double)ev.ts.tv_sec + (double)ev.ts.tv_nsec * 1e-9;
+        if ((now - last_press_ts) * 1000.0 < BUTTON_DEBOUNCE_MS) continue;
+        last_press_ts = now;
+
+        // Hand off to the main thread — do NOT save a file here.
+        g_button_toggle_requested.store(true);
+    }
+
+    gpiod_line_release(line);
+    gpiod_chip_close(chip);
+}
+#endif // USE_GPIO_BUTTON
+
+// ──────────────────────────────────────────────
 //  MAIN
 // ──────────────────────────────────────────────
 int main(int argc, char* argv[])
@@ -456,21 +541,16 @@ int main(int argc, char* argv[])
     std::cout << "\nUsing input=" << INPUT_DEVICE << "  output=" << OUTPUT_DEVICE << "\n\n";
 
     // ──────────────────────────────────────────
-    //  BUTTON HOOK — GPIO SETUP (implement on Pi)
+    //  GPIO BUTTON — launch watcher thread (Pi)
     // ──────────────────────────────────────────
-    // Recommended pattern with libgpiod or pigpio:
-    //   1. Configure the button pin as input with a pull-up/down and debounce.
-    //   2. Register a falling/rising edge interrupt.
-    //   3. In the ISR, do NOT save a file. Just request a toggle:
-    //          g_button_toggle_requested.store(true);
-    //      (declare it as a global std::atomic<bool> near g_is_recording).
-    //   4. The command loop below polls that flag and calls toggle_recording()
-    //      from this (non-interrupt) thread, so file I/O is safe.
-    //
-    // If your GPIO library debounces and lets you safely call back on a normal
-    // thread (not an ISR), you may call toggle_recording() directly from the
-    // callback instead of using the flag.
-    // ──────────────────────────────────────────
+    // The thread blocks on GPIO17 edge events and sets
+    // g_button_toggle_requested on each clean press. The command loop polls
+    // that flag and calls toggle_recording() on this thread, so the WAV write
+    // never happens in the button thread's context.
+    // Built only with -DUSE_GPIO_BUTTON; otherwise console controls are used.
+#ifdef USE_GPIO_BUTTON
+    std::thread button_thread(button_thread_fn);
+#endif
 
     PaStreamParameters inParams{};
     inParams.device           = INPUT_DEVICE;
@@ -523,13 +603,11 @@ int main(int argc, char* argv[])
             std::cout.flush();
         }
 
-        // ──────────────────────────────────────
-        //  BUTTON HOOK — POLL (implement on Pi)
-        // ──────────────────────────────────────
-        // if (g_button_toggle_requested.exchange(false)) {
-        //     toggle_recording();
-        // }
-        // ──────────────────────────────────────
+        // Physical button: the GPIO thread sets this flag on a clean press.
+        // We act on it here, on the normal thread, so the WAV save is safe.
+        if (g_button_toggle_requested.exchange(false)) {
+            toggle_recording();
+        }
 
 #ifndef _WIN32
         fd_set fds; FD_ZERO(&fds); FD_SET(0, &fds);
@@ -558,6 +636,12 @@ int main(int argc, char* argv[])
         Sleep(10);
 #endif
     }
+
+    // Tell the button thread to exit, then join it before tearing down audio.
+    g_running.store(false);
+#ifdef USE_GPIO_BUTTON
+    if (button_thread.joinable()) button_thread.join();
+#endif
 
     Pa_StopStream(inStream);  Pa_StopStream(outStream);
     Pa_CloseStream(inStream); Pa_CloseStream(outStream);
