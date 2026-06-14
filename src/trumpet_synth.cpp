@@ -66,7 +66,7 @@
 
 // ─────────────────────────── SETTINGS ─────────────────────────────────────
 
-static constexpr int    SR          = 22050;
+static constexpr int    SR          = 16000;
 static constexpr int    HOP_SIZE    = 128;   // aubio hop / input block
 static constexpr int    BUFFER_SIZE = 1024;  // aubio analysis window (was 512;
                                              // larger = steadier low notes)
