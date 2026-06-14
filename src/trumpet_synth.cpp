@@ -1,64 +1,74 @@
 /*
- * trumpet_synth.cpp  –  v4: low-note detection fix
+ * silent_jam.cpp  –  v5: trumpet_synth v4 + recording
  *
- * Change log vs v3:
- *   - Decoupled the aubio ANALYSIS WINDOW (BUFFER_SIZE) from the HOP_SIZE.
- *     v3 fed aubio only HOP_SIZE (128) samples, giving an effective musical
- *     pitch floor around G4 (~390 Hz) — YIN needs ≥2 periods in the window,
- *     so anything below that failed detection and never played back.
- *   - in_buf is now allocated at BUFFER_SIZE and filled from a persistent
- *     ring buffer holding the last BUFFER_SIZE input samples (rolling window),
- *     instead of zero-padding everything past the latest hop.
- *   - BUFFER_SIZE raised to 2048 → raw resolution floor ~21.5 Hz, reliable
- *     musical floor well below the trumpet's lowest note (E3 ~165 Hz).
+ * Combines:
+ *   - The v4 low-note detection + synthesis engine (rolling-window YIN,
+ *     pitch-adaptive harmonics, breath noise, glide, RMS-driven amplitude).
+ *     All thresholds and tuning values are kept from trumpet_synth v4.
+ *   - The recording feature ported from silent_jam.py / the recording build:
+ *     captures the SYNTHESIZED output (what you hear), normalises it, and
+ *     writes a timestamped mono WAV into ./recordings/ via libsndfile.
  *
- * Latency: output synthesis is unchanged and still runs per-hop. The larger
- * window only gives the DETECTOR more context; pitch estimate lags by up to
- * ~half a window (~23 ms at 2048) on the fastest articulation. Drop to 1024
- * if fast tonguing feels soft (floor still ~85 Hz musical).
+ * Monitoring is always live: you hear yourself play whether or not you are
+ * recording. Recording is a toggle — start, then stop to save.
  *
- * Build:
- *   g++ -O2 -o trumpet_synth trumpet_synth.cpp -lportaudio -laubio -lm
+ * Triggering recording:
+ *   - Console fallback (kept for testing): '1' toggles record, '0' quits.
+ *   - Physical button on the Pi: call toggle_recording() from your GPIO
+ *     interrupt handler. See the BUTTON HOOK comments in main() and below.
+ *
+ * Build (Linux / Raspberry Pi):
+ *   g++ -O2 -std=c++17 silent_jam.cpp \
+ *       -lportaudio -laubio -lsndfile -lm -o silent_jam
+ *
+ *   With CMake/pkg-config:
+ *     pkg_check_modules(... aubio portaudio-2.0 sndfile)
  *
  * Run:
- *   ./trumpet_synth [pitch_method]   (default: yinfast)
+ *   ./silent_jam [pitch_method]   (default: yinfast)
  */
 
 #include <aubio/aubio.h>
 #include <portaudio.h>
+#include <sndfile.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
+#include <ctime>
+#include <filesystem>
 #include <iostream>
+#include <mutex>
 #include <string>
-#include <algorithm>
+#include <vector>
 
 #ifndef M_PI
 #  define M_PI 3.14159265358979323846
 #endif
 
 // ──────────────────────────────────────────────
-//  SETTINGS — tune these on the Pi
+//  SETTINGS — tune these on the Pi  (kept from v4)
 // ──────────────────────────────────────────────
 static constexpr int    SR            = 44100;
-static constexpr int    BUFFER_SIZE   = 2048;   // analysis window (was 256)
+static constexpr int    BUFFER_SIZE   = 2048;   // analysis window (low-note fix)
 static constexpr int    HOP_SIZE      = 128;    // keep small for latency
 static constexpr int    INPUT_DEVICE  = 1;
 static constexpr int    OUTPUT_DEVICE = 0;
 
-// Gate (same as your v1)
+// Gate (kept from v4)
 static constexpr float  CONF_THRESHOLD      = 0.5f;
 static constexpr float  PLAY_CONF_THRESHOLD = 0.8f;
 static constexpr float  PLAY_LEVEL_DB       = -10.0f;
 static constexpr float  HOLD_TIME_S         = 0.05f;
 
-// Synthesis
-static constexpr float  OUTPUT_GAIN         = 0.30f;   // raise if too quiet
-static constexpr float  BREATH_MIX          = 0.06f;   // 0 = no breath noise, 0.15 = quite breathy
-static constexpr float  GLIDE_TIME_S        = 0.012f;  // pitch glide between notes (seconds)
-static constexpr float  ENV_ATTACK_S        = 0.004f;  // amplitude attack
-static constexpr float  ENV_RELEASE_S       = 0.060f;  // amplitude release
+// Synthesis (kept from v4)
+static constexpr float  OUTPUT_GAIN         = 0.30f;
+static constexpr float  BREATH_MIX          = 0.06f;
+static constexpr float  GLIDE_TIME_S        = 0.012f;
+static constexpr float  ENV_ATTACK_S        = 0.004f;
+static constexpr float  ENV_RELEASE_S       = 0.060f;
 
 // Telemetry
 static constexpr int    TELEM_INTERVAL      = 100;
@@ -70,6 +80,16 @@ static std::atomic<float>  g_freq         {0.0f};
 static std::atomic<float>  g_rms_lin      {0.0f};
 static std::atomic<double> g_last_good_ts {0.0};
 static std::atomic<double> g_last_pitch   {0.0};
+
+// ──────────────────────────────────────────────
+//  RECORDING STATE
+// ──────────────────────────────────────────────
+// g_is_recording is read in the realtime output callback (lock-free atomic).
+// g_recorded_chunks is appended under a mutex; the callback only locks briefly
+// to push the block it just synthesised. Saving happens off the audio thread.
+static std::atomic<bool>   g_is_recording{false};
+static std::mutex          g_chunks_mutex;
+static std::vector<float>  g_recorded_chunks;   // mono, one sample per frame
 
 // ──────────────────────────────────────────────
 //  TELEMETRY
@@ -95,25 +115,13 @@ static float g_ring[BUFFER_SIZE] = {};
 static int   g_ring_pos = 0;
 
 // ──────────────────────────────────────────────
-//  DSP HELPERS
+//  DSP HELPERS  (kept from v4)
 // ──────────────────────────────────────────────
-
-// One-pole IIR smoothing coefficient from time constant (seconds)
 static inline float smooth_coeff(float tau_s) {
     return 1.0f - expf(-1.0f / (tau_s * (float)SR));
 }
 
-// Pitch-adaptive harmonic amplitudes.
-//
-// A real trumpet's spectrum changes with pitch:
-//   - Low register (around Bb3, ~233 Hz): fundamental dominates, warm/round
-//   - High register (around Bb5, ~932 Hz): upper harmonics are much stronger, bright/brassy
-//
-// We interpolate between two measured-ish amplitude tables.
-// harmonics[k] = amplitude of (k+1)th partial (k=0 is fundamental)
 static constexpr int N_HARM = 8;
-
-//                                    f1     f2     f3     f4     f5     f6     f7     f8
 static constexpr float HARM_LOW[N_HARM]  = { 1.00f, 0.50f, 0.30f, 0.15f, 0.08f, 0.04f, 0.02f, 0.01f };
 static constexpr float HARM_HIGH[N_HARM] = { 0.70f, 0.80f, 0.60f, 0.45f, 0.30f, 0.18f, 0.10f, 0.06f };
 
@@ -128,15 +136,12 @@ static void harm_amps(float freq, float out[N_HARM]) {
     if (sum > 0.0f) for (int k = 0; k < N_HARM; ++k) out[k] /= sum;
 }
 
-// Fast LCG white noise (no stdlib calls in audio thread)
 static uint32_t lcg_state = 0x12345678u;
 static inline float white_noise() {
     lcg_state = lcg_state * 1664525u + 1013904223u;
     return ((int32_t)lcg_state) * (1.0f / 2147483648.0f);
 }
 
-// Simple bandpass via two one-pole low-passes subtracted
-// Centre ~800 Hz, bandwidth ~500 Hz — sits in the trumpet breath range
 struct BandpassState {
     float lp1 = 0.0f, lp2 = 0.0f;
     static constexpr float A1 = 0.11f;
@@ -149,7 +154,83 @@ struct BandpassState {
 };
 
 // ──────────────────────────────────────────────
-//  INPUT CALLBACK
+//  RECORDING CONTROL
+// ──────────────────────────────────────────────
+// Forward declaration — defined below save_recording().
+static void save_recording();
+
+// toggle_recording():  single entry point for BOTH the console command and
+// the physical button. Call this from your GPIO interrupt handler.
+//
+// NOTE ON CALLING FROM A GPIO ISR:
+//   Saving a WAV (file I/O + normalisation) must NOT run inside an interrupt
+//   context. This function only flips an atomic and, on stop, calls
+//   save_recording() directly — which is fine when called from the console
+//   thread. If you wire it to a hardware interrupt, do NOT call save_recording()
+//   inside the ISR. Instead, set a flag (e.g. g_save_requested) in the ISR and
+//   let the main loop notice it and call save_recording(). See the BUTTON HOOK
+//   block in main() for the recommended pattern.
+static void toggle_recording() {
+    if (!g_is_recording.load()) {
+        {
+            std::lock_guard<std::mutex> lk(g_chunks_mutex);
+            g_recorded_chunks.clear();
+        }
+        g_is_recording.store(true);
+        std::puts("\n[REC] Recording started...");
+    } else {
+        g_is_recording.store(false);
+        std::puts("\n[REC] Recording stopped. Saving...");
+        save_recording();
+    }
+}
+
+static void save_recording() {
+    std::vector<float> audio;
+    {
+        std::lock_guard<std::mutex> lk(g_chunks_mutex);
+        audio = g_recorded_chunks;  // copy out, release lock
+    }
+
+    if (audio.empty()) {
+        std::puts("[REC] Nothing to save.");
+        return;
+    }
+
+    // Normalise to 95% of full scale
+    float peak = 0.0f;
+    for (float s : audio) peak = std::max(peak, std::fabs(s));
+    if (peak > 0.0f) {
+        float scale = 0.95f / peak;
+        for (float& s : audio) s *= scale;
+    }
+
+    std::filesystem::create_directories("recordings");
+    std::time_t now_t = std::time(nullptr);
+    char ts[20];
+    std::strftime(ts, sizeof(ts), "%Y%m%d_%H%M%S", std::localtime(&now_t));
+    std::string filename = std::string("recordings/silentjam_") + ts + ".wav";
+
+    SF_INFO sfinfo{};
+    sfinfo.samplerate = SR;
+    sfinfo.channels   = 1;                                  // mono
+    sfinfo.format     = SF_FORMAT_WAV | SF_FORMAT_FLOAT;
+
+    SNDFILE* sf = sf_open(filename.c_str(), SFM_WRITE, &sfinfo);
+    if (!sf) {
+        std::fprintf(stderr, "[REC] Could not open %s: %s\n",
+                     filename.c_str(), sf_strerror(nullptr));
+        return;
+    }
+    sf_writef_float(sf, audio.data(), static_cast<sf_count_t>(audio.size()));
+    sf_close(sf);
+
+    std::printf("[REC] Saved: %s  (%.1f s)\n",
+                filename.c_str(), (double)audio.size() / SR);
+}
+
+// ──────────────────────────────────────────────
+//  INPUT CALLBACK  (kept from v4)
 // ──────────────────────────────────────────────
 static int input_callback(
         const void* inputBuffer, void*,
@@ -158,25 +239,19 @@ static int input_callback(
 {
     const float* in = static_cast<const float*>(inputBuffer);
 
-    // 1. Push this hop's samples into the rolling history ring buffer
     unsigned long n = std::min(framesPerBuffer, (unsigned long)HOP_SIZE);
     for (unsigned long i = 0; i < n; ++i) {
         g_ring[g_ring_pos] = in[i];
         g_ring_pos = (g_ring_pos + 1) % BUFFER_SIZE;
     }
-
-    // 2. Copy the full rolling window (oldest → newest) into aubio's buffer.
-    //    This is what lets YIN see enough periods to detect low notes.
     for (int i = 0; i < BUFFER_SIZE; ++i) {
         in_buf->data[i] = g_ring[(g_ring_pos + i) % BUFFER_SIZE];
     }
 
-    // 3. Pitch detect
     aubio_pitch_do(pitch_obj, in_buf, pitch_out);
     float pitch = fvec_get_sample(pitch_out, 0);
     float conf  = aubio_pitch_get_confidence(pitch_obj);
 
-    // 4. RMS + smoothed envelope (computed on just this hop, as before)
     float rms_sq = 0.0f;
     for (unsigned long i = 0; i < n; ++i) rms_sq += in[i] * in[i];
     float rms_lin = sqrtf(rms_sq / (float)n);
@@ -189,7 +264,6 @@ static int input_callback(
     env_rms = alpha * rms_lin + (1.0f - alpha) * env_rms;
     g_rms_lin.store(env_rms, std::memory_order_relaxed);
 
-    // 5. Gate (identical logic to v1, plus hold time)
     static double cb_time = 0.0;
     cb_time += (double)HOP_SIZE / SR;
 
@@ -205,7 +279,6 @@ static int input_callback(
         : 0.0f,
         std::memory_order_relaxed);
 
-    // 6. Telemetry
     telem_db_sum   += db;
     telem_conf_sum += conf;
     if (gate_open) { telem_hz_sum += pitch; telem_gate_sum++; }
@@ -225,7 +298,7 @@ static int input_callback(
 }
 
 // ──────────────────────────────────────────────
-//  OUTPUT CALLBACK  — synthesis
+//  OUTPUT CALLBACK  — synthesis (v4) + recording tap
 // ──────────────────────────────────────────────
 static int output_callback(
         const void*, void* outputBuffer,
@@ -237,7 +310,6 @@ static int output_callback(
     float target_freq = g_freq.load(std::memory_order_relaxed);
     float rms         = g_rms_lin.load(std::memory_order_relaxed);
 
-    // ── Persistent synthesis state ──
     static float phases[N_HARM]   = {};
     static float cur_freq         = 0.0f;
     static float env_amp          = 0.0f;
@@ -249,49 +321,60 @@ static int output_callback(
     static const float amp_alpha_a = smooth_coeff(ENV_ATTACK_S);
     static const float amp_alpha_r = smooth_coeff(ENV_RELEASE_S);
 
+    // Capture the mono signal for recording as we generate it. Both output
+    // channels are identical, so we store one sample per frame.
+    const bool recording = g_is_recording.load(std::memory_order_relaxed);
+    static std::vector<float> rec_scratch;   // reused; avoids per-callback alloc
+    if (recording) {
+        rec_scratch.clear();
+        rec_scratch.reserve(framesPerBuffer);
+    }
+
     bool playing = (target_freq > 0.0f);
 
     for (unsigned long i = 0; i < framesPerBuffer; ++i) {
 
-        // 1. Glide frequency toward target (phase-continuous — no clicks)
         if (playing) {
-            if (cur_freq < 10.0f) cur_freq = target_freq;  // snap on first note
+            if (cur_freq < 10.0f) cur_freq = target_freq;
             cur_freq += glide_alpha * (target_freq - cur_freq);
         }
 
-        // 2. Amplitude envelope follows RMS of the player's input
-        //    Scale rms to a useful range: rms ~0.01 (soft) to ~0.1 (loud)
         float amp_target = playing ? std::max(0.01f, rms * 8.0f) : 0.0f;
         float amp_alpha  = (amp_target > env_amp) ? amp_alpha_a : amp_alpha_r;
         env_amp += amp_alpha * (amp_target - env_amp);
 
-        // 3. Update harmonic table when pitch changes by more than ~3%
         if (fabsf(cur_freq - cached_freq) > cached_freq * 0.03f + 1.0f) {
             harm_amps(cur_freq, harm);
             cached_freq = cur_freq;
         }
 
-        // 4. Additive synthesis
         float sample = 0.0f;
         if (cur_freq > 10.0f) {
             float phase_inc_fund = 2.0f * (float)M_PI * cur_freq / (float)SR;
             for (int k = 0; k < N_HARM; ++k) {
-                if ((k + 1) * cur_freq >= (float)SR * 0.45f) break;  // skip above Nyquist
+                if ((k + 1) * cur_freq >= (float)SR * 0.45f) break;
                 phases[k] += (float)(k + 1) * phase_inc_fund;
                 if (phases[k] > (float)M_PI) phases[k] -= 2.0f * (float)M_PI;
                 sample += harm[k] * sinf(phases[k]);
             }
         }
 
-        // 5. Breath noise (bandpass filtered, mixed under tone)
         sample += bp.process(white_noise()) * BREATH_MIX * env_amp;
-
-        // 6. Envelope + gain + soft clip (tanh used lightly here, not for distortion)
         sample *= env_amp * OUTPUT_GAIN;
-        sample  = tanhf(sample * 0.8f) / 0.8f;  // headroom protection only
+        sample  = tanhf(sample * 0.8f) / 0.8f;
 
         out[2 * i]     = sample;
         out[2 * i + 1] = sample;
+
+        if (recording) rec_scratch.push_back(sample);
+    }
+
+    // Push this block into the recording buffer under the mutex. Kept outside
+    // the per-sample loop so we lock once per callback, not once per sample.
+    if (recording && !rec_scratch.empty()) {
+        std::lock_guard<std::mutex> lk(g_chunks_mutex);
+        g_recorded_chunks.insert(g_recorded_chunks.end(),
+                                 rec_scratch.begin(), rec_scratch.end());
     }
 
     return paContinue;
@@ -304,7 +387,7 @@ int main(int argc, char* argv[])
 {
     const char* method = (argc > 1) ? argv[1] : "yinfast";
 
-    std::cout << "trumpet_synth v4\n"
+    std::cout << "silent_jam v5  (v4 synth + recording)\n"
               << "Pitch method   : " << method << "\n"
               << "Analysis window: " << BUFFER_SIZE << " samples\n"
               << "Hop size       : " << HOP_SIZE << " samples\n"
@@ -316,7 +399,7 @@ int main(int argc, char* argv[])
     if (!pitch_obj) { std::cerr << "Failed to create aubio pitch object\n"; return 1; }
     aubio_pitch_set_unit(pitch_obj, "Hz");
     aubio_pitch_set_silence(pitch_obj, -40.0f);
-    in_buf    = new_fvec(BUFFER_SIZE);   // was new_fvec(HOP_SIZE)
+    in_buf    = new_fvec(BUFFER_SIZE);
     pitch_out = new_fvec(1);
 
     PaError err = Pa_Initialize();
@@ -331,6 +414,23 @@ int main(int argc, char* argv[])
                   << "  out=" << d->maxOutputChannels << "\n";
     }
     std::cout << "\nUsing input=" << INPUT_DEVICE << "  output=" << OUTPUT_DEVICE << "\n\n";
+
+    // ──────────────────────────────────────────
+    //  BUTTON HOOK — GPIO SETUP (implement on Pi)
+    // ──────────────────────────────────────────
+    // Recommended pattern with libgpiod or pigpio:
+    //   1. Configure the button pin as input with a pull-up/down and debounce.
+    //   2. Register a falling/rising edge interrupt.
+    //   3. In the ISR, do NOT save a file. Just request a toggle:
+    //          g_button_toggle_requested.store(true);
+    //      (declare it as a global std::atomic<bool> near g_is_recording).
+    //   4. The command loop below polls that flag and calls toggle_recording()
+    //      from this (non-interrupt) thread, so file I/O is safe.
+    //
+    // If your GPIO library debounces and lets you safely call back on a normal
+    // thread (not an ISR), you may call toggle_recording() directly from the
+    // callback instead of using the flag.
+    // ──────────────────────────────────────────
 
     PaStreamParameters inParams{};
     inParams.device           = INPUT_DEVICE;
@@ -356,14 +456,19 @@ int main(int argc, char* argv[])
     std::cout << "── Latency ──\n"
               << "  Input  : " << inInfo->inputLatency   * 1000.0 << " ms\n"
               << "  Output : " << outInfo->outputLatency * 1000.0 << " ms\n"
-              << "  Total  : " << (inInfo->inputLatency + outInfo->outputLatency) * 1000.0 << " ms\n\n"
-              << "Play into the mic. Telemetry every " << TELEM_INTERVAL << " callbacks.\n"
-              << "Press Enter to stop.\n\n";
-    std::cout.flush();
+              << "  Total  : " << (inInfo->inputLatency + outInfo->outputLatency) * 1000.0 << " ms\n\n";
 
     Pa_StartStream(inStream);
     Pa_StartStream(outStream);
 
+    std::puts("Live monitoring is ON — you can hear yourself whether or not you're recording.");
+    std::puts("Controls (console fallback): 1 = start/stop recording | 0 = quit");
+    std::puts("(Physical button calls the same toggle_recording().)\n");
+
+    // ── Command loop ──
+    // Uses select() so we can poll both stdin AND the button flag without
+    // blocking. Telemetry prints here too.
+    std::string line_buf;
     while (true) {
         if (g_telem_ready.load(std::memory_order_acquire)) {
             TelemSnapshot s = g_telem_snap;
@@ -372,16 +477,44 @@ int main(int argc, char* argv[])
                       << "  Avg level  : " << s.avg_db   << " dBFS\n"
                       << "  Avg conf   : " << s.avg_conf << "\n"
                       << "  Avg pitch  : " << s.avg_hz   << " Hz\n"
-                      << "  Gate open  : " << s.gate_pct << "%\n"
-                      << "─────────────────────────────\n";
+                      << "  Gate open  : " << s.gate_pct << "%"
+                      << (g_is_recording.load() ? "   [REC ●]" : "")
+                      << "\n─────────────────────────────\n";
             std::cout.flush();
         }
+
+        // ──────────────────────────────────────
+        //  BUTTON HOOK — POLL (implement on Pi)
+        // ──────────────────────────────────────
+        // if (g_button_toggle_requested.exchange(false)) {
+        //     toggle_recording();
+        // }
+        // ──────────────────────────────────────
+
 #ifndef _WIN32
         fd_set fds; FD_ZERO(&fds); FD_SET(0, &fds);
-        struct timeval tv = {0, 10000};
-        if (select(1, &fds, nullptr, nullptr, &tv) > 0) break;
+        struct timeval tv = {0, 10000};   // 10 ms poll
+        if (select(1, &fds, nullptr, nullptr, &tv) > 0) {
+            if (!std::getline(std::cin, line_buf)) break;  // EOF
+            if (line_buf == "1") {
+                toggle_recording();
+            } else if (line_buf == "0") {
+                if (g_is_recording.load()) toggle_recording();  // stop+save first
+                std::puts("Goodbye!");
+                break;
+            } else if (!line_buf.empty()) {
+                std::puts("Unknown command. 1 = record | 0 = quit");
+            }
+        }
 #else
-        if (_kbhit()) { int c = _getch(); if (c == '\r' || c == '\n') break; }
+        if (_kbhit()) {
+            int c = _getch();
+            if (c == '1') toggle_recording();
+            else if (c == '0') {
+                if (g_is_recording.load()) toggle_recording();
+                break;
+            }
+        }
         Sleep(10);
 #endif
     }
@@ -390,5 +523,6 @@ int main(int argc, char* argv[])
     Pa_CloseStream(inStream); Pa_CloseStream(outStream);
     Pa_Terminate();
     del_aubio_pitch(pitch_obj); del_fvec(in_buf); del_fvec(pitch_out);
+    aubio_cleanup();
     return 0;
 }
