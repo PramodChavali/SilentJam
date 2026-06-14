@@ -1,21 +1,21 @@
 /*
- * trumpet_synth.cpp  –  v3: improved in-process synthesis
+ * trumpet_synth.cpp  –  v4: low-note detection fix
  *
- * Key improvements over v1:
- *   1. Pitch-adaptive harmonic amplitudes  — harmonic ratios shift with frequency
- *      to match a real trumpet's acoustic behaviour (brighter high notes,
- *      rounder low notes)
- *   2. Smooth frequency glide              — phase-continuous pitch interpolation
- *      between detected notes; no clicks on note changes
- *   3. RMS-driven amplitude               — output volume tracks how hard you play
- *   4. Breath noise layer                 — bandpass-filtered noise mixed under
- *      the tone, scaled with RMS, gives attack transient texture
- *   5. Soft note on/off envelope          — smooth ramp on gate open/close
- *   6. Same gate logic as your v1         — PLAY_CONF_THRESHOLD + PLAY_LEVEL_DB
- *      with HOLD_TIME to prevent mid-note dropouts
+ * Change log vs v3:
+ *   - Decoupled the aubio ANALYSIS WINDOW (BUFFER_SIZE) from the HOP_SIZE.
+ *     v3 fed aubio only HOP_SIZE (128) samples, giving an effective musical
+ *     pitch floor around G4 (~390 Hz) — YIN needs ≥2 periods in the window,
+ *     so anything below that failed detection and never played back.
+ *   - in_buf is now allocated at BUFFER_SIZE and filled from a persistent
+ *     ring buffer holding the last BUFFER_SIZE input samples (rolling window),
+ *     instead of zero-padding everything past the latest hop.
+ *   - BUFFER_SIZE raised to 2048 → raw resolution floor ~21.5 Hz, reliable
+ *     musical floor well below the trumpet's lowest note (E3 ~165 Hz).
  *
- * Latency: same as v1 — pitch detect and synthesis both happen per-callback,
- * no inter-thread audio buffering.
+ * Latency: output synthesis is unchanged and still runs per-hop. The larger
+ * window only gives the DETECTOR more context; pitch estimate lags by up to
+ * ~half a window (~23 ms at 2048) on the fastest articulation. Drop to 1024
+ * if fast tonguing feels soft (floor still ~85 Hz musical).
  *
  * Build:
  *   g++ -O2 -o trumpet_synth trumpet_synth.cpp -lportaudio -laubio -lm
@@ -42,8 +42,8 @@
 //  SETTINGS — tune these on the Pi
 // ──────────────────────────────────────────────
 static constexpr int    SR            = 44100;
-static constexpr int    BUFFER_SIZE   = 256;
-static constexpr int    HOP_SIZE      = 128;
+static constexpr int    BUFFER_SIZE   = 2048;   // analysis window (was 256)
+static constexpr int    HOP_SIZE      = 128;    // keep small for latency
 static constexpr int    INPUT_DEVICE  = 1;
 static constexpr int    OUTPUT_DEVICE = 0;
 
@@ -89,6 +89,10 @@ static int   telem_gate_sum = 0;
 static aubio_pitch_t* pitch_obj = nullptr;
 static fvec_t*        in_buf    = nullptr;
 static fvec_t*        pitch_out = nullptr;
+
+// Rolling input history fed to aubio each hop.
+static float g_ring[BUFFER_SIZE] = {};
+static int   g_ring_pos = 0;
 
 // ──────────────────────────────────────────────
 //  DSP HELPERS
@@ -154,17 +158,25 @@ static int input_callback(
 {
     const float* in = static_cast<const float*>(inputBuffer);
 
-    // 1. Feed aubio
+    // 1. Push this hop's samples into the rolling history ring buffer
     unsigned long n = std::min(framesPerBuffer, (unsigned long)HOP_SIZE);
-    for (unsigned long i = 0; i < n; ++i) in_buf->data[i] = in[i];
-    for (unsigned long i = n; i < (unsigned long)HOP_SIZE; ++i) in_buf->data[i] = 0.0f;
+    for (unsigned long i = 0; i < n; ++i) {
+        g_ring[g_ring_pos] = in[i];
+        g_ring_pos = (g_ring_pos + 1) % BUFFER_SIZE;
+    }
 
-    // 2. Pitch detect
+    // 2. Copy the full rolling window (oldest → newest) into aubio's buffer.
+    //    This is what lets YIN see enough periods to detect low notes.
+    for (int i = 0; i < BUFFER_SIZE; ++i) {
+        in_buf->data[i] = g_ring[(g_ring_pos + i) % BUFFER_SIZE];
+    }
+
+    // 3. Pitch detect
     aubio_pitch_do(pitch_obj, in_buf, pitch_out);
     float pitch = fvec_get_sample(pitch_out, 0);
     float conf  = aubio_pitch_get_confidence(pitch_obj);
 
-    // 3. RMS + smoothed envelope
+    // 4. RMS + smoothed envelope (computed on just this hop, as before)
     float rms_sq = 0.0f;
     for (unsigned long i = 0; i < n; ++i) rms_sq += in[i] * in[i];
     float rms_lin = sqrtf(rms_sq / (float)n);
@@ -177,7 +189,7 @@ static int input_callback(
     env_rms = alpha * rms_lin + (1.0f - alpha) * env_rms;
     g_rms_lin.store(env_rms, std::memory_order_relaxed);
 
-    // 4. Gate (identical logic to v1, plus hold time)
+    // 5. Gate (identical logic to v1, plus hold time)
     static double cb_time = 0.0;
     cb_time += (double)HOP_SIZE / SR;
 
@@ -193,7 +205,7 @@ static int input_callback(
         : 0.0f,
         std::memory_order_relaxed);
 
-    // 5. Telemetry
+    // 6. Telemetry
     telem_db_sum   += db;
     telem_conf_sum += conf;
     if (gate_open) { telem_hz_sum += pitch; telem_gate_sum++; }
@@ -292,9 +304,10 @@ int main(int argc, char* argv[])
 {
     const char* method = (argc > 1) ? argv[1] : "yinfast";
 
-    std::cout << "trumpet_synth v3\n"
+    std::cout << "trumpet_synth v4\n"
               << "Pitch method   : " << method << "\n"
-              << "Buffer/hop     : " << BUFFER_SIZE << "/" << HOP_SIZE << "\n"
+              << "Analysis window: " << BUFFER_SIZE << " samples\n"
+              << "Hop size       : " << HOP_SIZE << " samples\n"
               << "Sample rate    : " << SR << " Hz\n"
               << "Glide time     : " << GLIDE_TIME_S * 1000.0f << " ms\n"
               << "Breath mix     : " << BREATH_MIX << "\n\n";
@@ -303,7 +316,7 @@ int main(int argc, char* argv[])
     if (!pitch_obj) { std::cerr << "Failed to create aubio pitch object\n"; return 1; }
     aubio_pitch_set_unit(pitch_obj, "Hz");
     aubio_pitch_set_silence(pitch_obj, -40.0f);
-    in_buf    = new_fvec(HOP_SIZE);
+    in_buf    = new_fvec(BUFFER_SIZE);   // was new_fvec(HOP_SIZE)
     pitch_out = new_fvec(1);
 
     PaError err = Pa_Initialize();
