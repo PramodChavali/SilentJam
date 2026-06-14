@@ -423,6 +423,9 @@ int main(int argc, char* argv[]) {
     out_params.sampleFormat     = paFloat32;
     out_params.suggestedLatency = Pa_GetDeviceInfo(OUTPUT_DEVICE)->defaultLowOutputLatency;
 
+    const PaDeviceInfo* d = Pa_GetDeviceInfo(INPUT_DEVICE);
+s   td::printf("Input device: %s, defaultSR=%.0f\n", d->name, d->defaultSampleRate);
+
     PaStream* in_stream = nullptr;
     err = Pa_OpenStream(&in_stream, &in_params, nullptr, SR, HOP_SIZE,
                         paClipOff, input_callback, &in_state);
