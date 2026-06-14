@@ -30,7 +30,7 @@ static constexpr int    SR            = 22050;
 static constexpr int    BUFFER_SIZE   = 128;
 static constexpr int    HOP_SIZE      = 64;
 static constexpr int    INPUT_DEVICE  = 1;
-static constexpr int    OUTPUT_DEVICE = 4;
+static constexpr int    OUTPUT_DEVICE = 8;
 
 static constexpr double CONF_THRESHOLD      = 0.5;
 static constexpr double PLAY_CONF_THRESHOLD = 0.8;
