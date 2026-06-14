@@ -1,31 +1,19 @@
 /*
- * silent_jam.cpp  –  v5: trumpet_synth v4 + recording
+ * silent_jam.cpp  –  v5 + pigpio button
  *
- * Combines:
- *   - The v4 low-note detection + synthesis engine (rolling-window YIN,
- *     pitch-adaptive harmonics, breath noise, glide, RMS-driven amplitude).
- *     All thresholds and tuning values are kept from trumpet_synth v4.
- *   - The recording feature ported from silent_jam.py / the recording build:
- *     captures the SYNTHESIZED output (what you hear), normalises it, and
- *     writes a timestamped mono WAV into ./recordings/ via libsndfile.
+ * Recording branch (v5) merged with pigpio button from trumpet_synth.
+ * Button on GPIO16: press = start recording, press again = stop + save WAV.
  *
- * Monitoring is always live: you hear yourself play whether or not you are
- * recording. Recording is a toggle — start, then stop to save.
+ * Build:
+ *   g++ -O2 -std=c++17 silent_jam.cpp \
+ *       -lportaudio -laubio -lsndfile -lm -lpigpio -lrt -lpthread \
+ *       -DUSE_GPIO_BUTTON -o silent_jam
  *
- * Triggering recording:
- *   - Console fallback (kept for testing): '1' toggles record, '0' quits.
- *   - Physical button on the Pi: call toggle_recording() from your GPIO
- *     interrupt handler. See the BUTTON HOOK comments in main() and below.
- *
- * Build (Linux / Raspberry Pi):
+ *   Without button:
  *   g++ -O2 -std=c++17 silent_jam.cpp \
  *       -lportaudio -laubio -lsndfile -lm -o silent_jam
  *
- *   With CMake/pkg-config:
- *     pkg_check_modules(... aubio portaudio-2.0 sndfile)
- *
- * Run:
- *   ./silent_jam [pitch_method]   (default: yinfast)
+ * Run:  sudo ./silent_jam [pitch_method]   (default: yinfast)
  */
 
 #include <aubio/aubio.h>
@@ -40,16 +28,16 @@
 #include <ctime>
 #include <filesystem>
 #include <iostream>
-#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
 
-// GPIO button support (Raspberry Pi). Compile with -DUSE_GPIO_BUTTON and link
-// against libgpiod (-lgpiod). On non-Pi builds, leave the flag off and the
-// button code is excluded so the file still compiles anywhere.
+#include <sys/select.h>
+#include <sys/time.h>
+#include <unistd.h>
+
 #ifdef USE_GPIO_BUTTON
-#  include <gpiod.h>
+#  include <pigpio.h>
 #endif
 
 #ifndef M_PI
@@ -57,75 +45,57 @@
 #endif
 
 // ──────────────────────────────────────────────
-//  SETTINGS — tune these on the Pi  (kept from v4)
+//  SETTINGS
 // ──────────────────────────────────────────────
 static constexpr int    SR            = 44100;
-static constexpr int    BUFFER_SIZE   = 1024;   // analysis window — 1024 keeps the
-                                                // low-note fix (musical floor ~85 Hz,
-                                                // an octave below any trumpet note)
-                                                // while halving onset lag vs 2048
-static constexpr int    HOP_SIZE      = 128;    // keep small for latency
-static constexpr int    INPUT_DEVICE  = 1;
-static constexpr int    OUTPUT_DEVICE = 0;
+static constexpr int    BUFFER_SIZE   = 1024;
+static constexpr int    HOP_SIZE      = 128;
+static constexpr int    INPUT_DEVICE  = 1;   // USB PnP mic
+static constexpr int    OUTPUT_DEVICE = 0;   // bcm2835 headphones
 
-// GPIO button (Raspberry Pi). Button wired across 3.3V and GPIO17; internal
-// pull-down enabled in software, so press = HIGH, rising edge = toggle record.
-static constexpr int    BUTTON_GPIO_CHIP_LINE = 17;     // BCM GPIO17 (phys pin 11)
-static constexpr int    BUTTON_DEBOUNCE_MS    = 40;     // ignore bounces within this
-static constexpr const char* BUTTON_GPIO_CHIP = "gpiochip0";  // Pi 4B main bank
+static constexpr int    BUTTON_PIN         = 16;   // BCM GPIO16 (physical pin 36)
+static constexpr int    BUTTON_DEBOUNCE_MS = 200;
 
-// Gate (kept from v4)
+// Gate
 static constexpr float  CONF_THRESHOLD      = 0.5f;
 static constexpr float  PLAY_CONF_THRESHOLD = 0.8f;
 static constexpr float  PLAY_LEVEL_DB       = -10.0f;
 static constexpr float  HOLD_TIME_S         = 0.05f;
 
-// Synthesis (kept from v4)
+// Synthesis
 static constexpr float  OUTPUT_GAIN         = 0.30f;
 static constexpr float  BREATH_MIX          = 0.06f;
 static constexpr float  GLIDE_TIME_S        = 0.012f;
 static constexpr float  ENV_ATTACK_S        = 0.004f;
 static constexpr float  ENV_RELEASE_S       = 0.060f;
 
-// Dynamics — output loudness follows how hard you play, based on input dB.
-// The input level is smoothed slowly (DYN_SMOOTH_S) so the volume tracks your
-// breath, not the mic's per-sample jitter, keeping the tone consistent.
-//   DYN_DB_SOFT  : input dB mapped to the quietest output (DYN_GAIN_MIN)
-//   DYN_DB_LOUD  : input dB mapped to full output (1.0)
-//   DYN_GAIN_MIN : floor gain so soft notes stay clean & present, never vanish
-// Set DYN_GAIN_MIN = 1.0f to disable dynamics (constant volume).
-static constexpr float  DYN_SMOOTH_S        = 0.150f;  // 150 ms loudness tracking
-static constexpr float  DYN_DB_SOFT         = -30.0f;  // soft playing level (dBFS)
-static constexpr float  DYN_DB_LOUD         = -8.0f;   // loud playing level (dBFS)
-static constexpr float  DYN_GAIN_MIN        = 0.40f;   // floor: softest = 40% vol
+// Dynamics
+static constexpr float  DYN_SMOOTH_S        = 0.150f;
+static constexpr float  DYN_DB_SOFT         = -30.0f;
+static constexpr float  DYN_DB_LOUD         = -8.0f;
+static constexpr float  DYN_GAIN_MIN        = 0.40f;
 
 // Telemetry
 static constexpr int    TELEM_INTERVAL      = 100;
 
 // ──────────────────────────────────────────────
-//  SHARED STATE  (input callback → output callback)
+//  SHARED STATE
 // ──────────────────────────────────────────────
 static std::atomic<float>  g_freq         {0.0f};
 static std::atomic<float>  g_rms_lin      {0.0f};
-static std::atomic<float>  g_dyn_gain     {1.0f};   // smoothed loudness 0..1 (dynamics)
+static std::atomic<float>  g_dyn_gain     {1.0f};
 static std::atomic<double> g_last_good_ts {0.0};
 static std::atomic<double> g_last_pitch   {0.0};
 
 // ──────────────────────────────────────────────
 //  RECORDING STATE
 // ──────────────────────────────────────────────
-// g_is_recording is read in the realtime output callback (lock-free atomic).
-// g_recorded_chunks is appended under a mutex; the callback only locks briefly
-// to push the block it just synthesised. Saving happens off the audio thread.
 static std::atomic<bool>   g_is_recording{false};
-static std::mutex          g_chunks_mutex;
-static std::vector<float>  g_recorded_chunks;   // mono, one sample per frame
+static std::vector<float>  g_recorded_chunks;
+static std::atomic<size_t> g_rec_write_pos{0};
 
-// Set by the GPIO button thread on a clean press; the main loop polls it and
-// calls toggle_recording() on the normal thread (so file I/O never runs inside
-// the button thread's event context).
+// Button sets this flag; main loop acts on it (so file I/O never runs in button thread)
 static std::atomic<bool>   g_button_toggle_requested{false};
-// Tells the button thread to exit cleanly on shutdown.
 static std::atomic<bool>   g_running{true};
 
 // ──────────────────────────────────────────────
@@ -147,12 +117,11 @@ static aubio_pitch_t* pitch_obj = nullptr;
 static fvec_t*        in_buf    = nullptr;
 static fvec_t*        pitch_out = nullptr;
 
-// Rolling input history fed to aubio each hop.
 static float g_ring[BUFFER_SIZE] = {};
 static int   g_ring_pos = 0;
 
 // ──────────────────────────────────────────────
-//  DSP HELPERS  (kept from v4)
+//  DSP HELPERS
 // ──────────────────────────────────────────────
 static inline float smooth_coeff(float tau_s) {
     return 1.0f - expf(-1.0f / (tau_s * (float)SR));
@@ -193,54 +162,12 @@ struct BandpassState {
 // ──────────────────────────────────────────────
 //  RECORDING CONTROL
 // ──────────────────────────────────────────────
-// Forward declaration — defined below save_recording().
-static void save_recording();
-
-// toggle_recording():  single entry point for BOTH the console command and
-// the physical button. Call this from your GPIO interrupt handler.
-//
-// NOTE ON CALLING FROM A GPIO ISR:
-//   Saving a WAV (file I/O + normalisation) must NOT run inside an interrupt
-//   context. This function only flips an atomic and, on stop, calls
-//   save_recording() directly — which is fine when called from the console
-//   thread. If you wire it to a hardware interrupt, do NOT call save_recording()
-//   inside the ISR. Instead, set a flag (e.g. g_save_requested) in the ISR and
-//   let the main loop notice it and call save_recording(). See the BUTTON HOOK
-//   block in main() for the recommended pattern.
-static void toggle_recording() {
-    if (!g_is_recording.load()) {
-        {
-            std::lock_guard<std::mutex> lk(g_chunks_mutex);
-            g_recorded_chunks.clear();
-        }
-        g_is_recording.store(true);
-        std::puts("\n[REC] Recording started...");
-    } else {
-        g_is_recording.store(false);
-        std::puts("\n[REC] Recording stopped. Saving...");
-        save_recording();
-    }
-}
-
 static void save_recording() {
-    std::vector<float> audio;
-    {
-        std::lock_guard<std::mutex> lk(g_chunks_mutex);
-        audio = g_recorded_chunks;  // copy out, release lock
-    }
+    size_t len = g_rec_write_pos.load(std::memory_order_relaxed);
+    if (len == 0) { std::puts("[REC] Nothing to save."); return; }
 
-    if (audio.empty()) {
-        std::puts("[REC] Nothing to save.");
-        return;
-    }
-
-    // Normalise to 95% of full scale
-    float peak = 0.0f;
-    for (float s : audio) peak = std::max(peak, std::fabs(s));
-    if (peak > 0.0f) {
-        float scale = 0.95f / peak;
-        for (float& s : audio) s *= scale;
-    }
+    std::vector<float> audio(g_recorded_chunks.begin(),
+                             g_recorded_chunks.begin() + len);
 
     std::filesystem::create_directories("recordings");
     std::time_t now_t = std::time(nullptr);
@@ -250,7 +177,7 @@ static void save_recording() {
 
     SF_INFO sfinfo{};
     sfinfo.samplerate = SR;
-    sfinfo.channels   = 1;                                  // mono
+    sfinfo.channels   = 2;
     sfinfo.format     = SF_FORMAT_WAV | SF_FORMAT_FLOAT;
 
     SNDFILE* sf = sf_open(filename.c_str(), SFM_WRITE, &sfinfo);
@@ -259,15 +186,28 @@ static void save_recording() {
                      filename.c_str(), sf_strerror(nullptr));
         return;
     }
-    sf_writef_float(sf, audio.data(), static_cast<sf_count_t>(audio.size()));
+    sf_writef_float(sf, audio.data(), (sf_count_t)(len / 2));
     sf_close(sf);
 
     std::printf("[REC] Saved: %s  (%.1f s)\n",
-                filename.c_str(), (double)audio.size() / SR);
+                filename.c_str(), (double)(len / 2) / SR);
+    g_rec_write_pos.store(0, std::memory_order_relaxed);
+}
+
+static void toggle_recording() {
+    if (!g_is_recording.load()) {
+        g_rec_write_pos.store(0, std::memory_order_relaxed);
+        g_is_recording.store(true);
+        std::puts("\n[REC] Recording started...");
+    } else {
+        g_is_recording.store(false);
+        std::puts("\n[REC] Recording stopped. Saving...");
+        save_recording();
+    }
 }
 
 // ──────────────────────────────────────────────
-//  INPUT CALLBACK  (kept from v4)
+//  INPUT CALLBACK
 // ──────────────────────────────────────────────
 static int input_callback(
         const void* inputBuffer, void*,
@@ -281,9 +221,8 @@ static int input_callback(
         g_ring[g_ring_pos] = in[i];
         g_ring_pos = (g_ring_pos + 1) % BUFFER_SIZE;
     }
-    for (int i = 0; i < BUFFER_SIZE; ++i) {
+    for (int i = 0; i < BUFFER_SIZE; ++i)
         in_buf->data[i] = g_ring[(g_ring_pos + i) % BUFFER_SIZE];
-    }
 
     aubio_pitch_do(pitch_obj, in_buf, pitch_out);
     float pitch = fvec_get_sample(pitch_out, 0);
@@ -301,18 +240,14 @@ static int input_callback(
     env_rms = alpha * rms_lin + (1.0f - alpha) * env_rms;
     g_rms_lin.store(env_rms, std::memory_order_relaxed);
 
-    // Dynamics: slowly smooth the input dB, map it to an output gain in
-    // [DYN_GAIN_MIN, 1.0]. Slow smoothing is what keeps the resulting volume
-    // steady instead of chasing the mic's jitter. Hop-rate one-pole, so the
-    // coefficient is per-hop (HOP_SIZE samples), not per-sample.
     static float dyn_db = DYN_DB_SOFT;
     static const float dyn_alpha =
         1.0f - expf(-1.0f / (DYN_SMOOTH_S * (float)SR / (float)HOP_SIZE));
     dyn_db += dyn_alpha * (db - dyn_db);
     float dyn_t    = (dyn_db - DYN_DB_SOFT) / (DYN_DB_LOUD - DYN_DB_SOFT);
     dyn_t          = std::max(0.0f, std::min(1.0f, dyn_t));
-    float dyn_gain = DYN_GAIN_MIN + (1.0f - DYN_GAIN_MIN) * dyn_t;
-    g_dyn_gain.store(dyn_gain, std::memory_order_relaxed);
+    g_dyn_gain.store(DYN_GAIN_MIN + (1.0f - DYN_GAIN_MIN) * dyn_t,
+                     std::memory_order_relaxed);
 
     static double cb_time = 0.0;
     cb_time += (double)HOP_SIZE / SR;
@@ -348,7 +283,7 @@ static int input_callback(
 }
 
 // ──────────────────────────────────────────────
-//  OUTPUT CALLBACK  — synthesis (v4) + recording tap
+//  OUTPUT CALLBACK
 // ──────────────────────────────────────────────
 static int output_callback(
         const void*, void* outputBuffer,
@@ -358,13 +293,11 @@ static int output_callback(
     float* out = static_cast<float*>(outputBuffer);
 
     float target_freq = g_freq.load(std::memory_order_relaxed);
-    float dyn_gain    = g_dyn_gain.load(std::memory_order_relaxed);  // 0..1 loudness
-    // (input RMS is still tracked on the input side for telemetry; output level
-    //  is the fixed envelope below, scaled by the smoothed dynamics gain.)
+    float dyn_gain    = g_dyn_gain.load(std::memory_order_relaxed);
 
     static float phases[N_HARM]   = {};
     static float cur_freq         = 0.0f;
-    static float env_dyn          = 1.0f;   // per-sample-smoothed dynamics gain
+    static float env_dyn          = 1.0f;
     static float env_amp          = 0.0f;
     static float cached_freq      = 0.0f;
     static float harm[N_HARM]     = {};
@@ -374,34 +307,18 @@ static int output_callback(
     static const float amp_alpha_a = smooth_coeff(ENV_ATTACK_S);
     static const float amp_alpha_r = smooth_coeff(ENV_RELEASE_S);
 
-    // Capture the mono signal for recording as we generate it. Both output
-    // channels are identical, so we store one sample per frame.
     const bool recording = g_is_recording.load(std::memory_order_relaxed);
-    static std::vector<float> rec_scratch;   // reused; avoids per-callback alloc
-    if (recording) {
-        rec_scratch.clear();
-        rec_scratch.reserve(framesPerBuffer);
-    }
-
     bool playing = (target_freq > 0.0f);
 
     for (unsigned long i = 0; i < framesPerBuffer; ++i) {
-
         if (playing) {
             if (cur_freq < 10.0f) cur_freq = target_freq;
             cur_freq += glide_alpha * (target_freq - cur_freq);
         }
 
-        // On/off envelope: a smooth attack/release gate so notes start and stop
-        // click-free. The sustained LEVEL is constant (1.0) — loudness comes from
-        // the dynamics gain below, not from chasing the noisy input amplitude.
         float amp_target = playing ? 1.0f : 0.0f;
         float amp_alpha  = (amp_target > env_amp) ? amp_alpha_a : amp_alpha_r;
         env_amp += amp_alpha * (amp_target - env_amp);
-
-        // Dynamics: glide the loudness gain toward the value the input side set.
-        // Already slow-smoothed there; this extra per-sample glide just removes
-        // any block-rate stepping so swells are perfectly smooth.
         env_dyn += amp_alpha_r * (dyn_gain - env_dyn);
 
         if (fabsf(cur_freq - cached_freq) > cached_freq * 0.03f + 1.0f) {
@@ -427,83 +344,59 @@ static int output_callback(
         out[2 * i]     = sample;
         out[2 * i + 1] = sample;
 
-        if (recording) rec_scratch.push_back(sample);
-    }
-
-    // Push this block into the recording buffer under the mutex. Kept outside
-    // the per-sample loop so we lock once per callback, not once per sample.
-    if (recording && !rec_scratch.empty()) {
-        std::lock_guard<std::mutex> lk(g_chunks_mutex);
-        g_recorded_chunks.insert(g_recorded_chunks.end(),
-                                 rec_scratch.begin(), rec_scratch.end());
+        if (recording) {
+            size_t pos = g_rec_write_pos.load(std::memory_order_relaxed);
+            if (pos + 2 <= g_recorded_chunks.size()) {
+                g_recorded_chunks[pos]     = sample;
+                g_recorded_chunks[pos + 1] = sample;
+                g_rec_write_pos.store(pos + 2, std::memory_order_relaxed);
+            }
+        }
     }
 
     return paContinue;
 }
 
 // ──────────────────────────────────────────────
-//  GPIO BUTTON THREAD  (Raspberry Pi, libgpiod v1.x)
+//  GPIO BUTTON THREAD  (pigpio)
 // ──────────────────────────────────────────────
-// Blocks waiting for rising edges on GPIO17 (press = HIGH thanks to the
-// internal pull-down). Debounces in software, then sets a flag the main loop
-// acts on. Uses zero CPU while waiting. Excluded unless -DUSE_GPIO_BUTTON.
+// Polls GPIO16 with internal pull-up (idle HIGH, press LOW = falling edge).
+// On each clean press, sets g_button_toggle_requested. The main loop acts on
+// it so WAV saves never happen inside this thread.
 #ifdef USE_GPIO_BUTTON
 static void button_thread_fn() {
-    gpiod_chip* chip = gpiod_chip_open_by_name(BUTTON_GPIO_CHIP);
-    if (!chip) {
-        std::fprintf(stderr, "[BTN] Could not open %s — button disabled. "
-                             "Console controls still work.\n", BUTTON_GPIO_CHIP);
-        return;
-    }
-    gpiod_line* line = gpiod_chip_get_line(chip, BUTTON_GPIO_CHIP_LINE);
-    if (!line) {
-        std::fprintf(stderr, "[BTN] Could not get GPIO%d — button disabled.\n",
-                     BUTTON_GPIO_CHIP_LINE);
-        gpiod_chip_close(chip);
-        return;
-    }
+    gpioSetMode(BUTTON_PIN, PI_INPUT);
+    gpioSetPullUpDown(BUTTON_PIN, PI_PUD_UP);  // idle HIGH, press LOW
 
-    // Request rising-edge events with the internal pull-down enabled.
-    gpiod_line_request_config cfg{};
-    cfg.consumer    = "silent_jam";
-    cfg.request_type = GPIOD_LINE_REQUEST_EVENT_RISING_EDGE;
-    cfg.flags       = GPIOD_LINE_REQUEST_FLAG_BIAS_PULL_DOWN;
-    if (gpiod_line_request(line, &cfg, 0) < 0) {
-        std::fprintf(stderr, "[BTN] Failed to request GPIO%d events "
-                             "(need permission? try running with sudo, or add "
-                             "your user to the 'gpio' group). Button disabled.\n",
-                     BUTTON_GPIO_CHIP_LINE);
-        gpiod_chip_close(chip);
-        return;
-    }
+    bool previous = gpioRead(BUTTON_PIN);
+    double last_press = 0.0;
 
-    std::printf("[BTN] Button ready on GPIO%d — press to start/stop recording.\n",
-                BUTTON_GPIO_CHIP_LINE);
+    std::printf("[BTN] Button ready on GPIO%d\n", BUTTON_PIN);
+    std::fflush(stdout);
 
-    double last_press_ts = 0.0;
     while (g_running.load()) {
-        // Wait up to 200 ms for an edge, then loop so we can check g_running.
-        timespec timeout{0, 200 * 1000 * 1000};
-        int rv = gpiod_line_event_wait(line, &timeout);
-        if (rv < 0) break;        // error
-        if (rv == 0) continue;    // timeout, just re-check g_running
+        bool current = gpioRead(BUTTON_PIN);
 
-        gpiod_line_event ev;
-        if (gpiod_line_event_read(line, &ev) < 0) continue;
+        if (previous && !current) {   // falling edge = press
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            double now = ts.tv_sec + ts.tv_nsec * 1e-9;
 
-        // Software debounce: ignore edges within BUTTON_DEBOUNCE_MS of the last.
-        double now = (double)ev.ts.tv_sec + (double)ev.ts.tv_nsec * 1e-9;
-        if ((now - last_press_ts) * 1000.0 < BUTTON_DEBOUNCE_MS) continue;
-        last_press_ts = now;
+            if ((now - last_press) * 1000.0 >= BUTTON_DEBOUNCE_MS) {
+                last_press = now;
+                g_button_toggle_requested.store(true);
+                std::printf("[BTN] Press detected\n");
+                std::fflush(stdout);
+            }
+        }
 
-        // Hand off to the main thread — do NOT save a file here.
-        g_button_toggle_requested.store(true);
+        previous = current;
+        usleep(5000);  // 5 ms poll
     }
 
-    gpiod_line_release(line);
-    gpiod_chip_close(chip);
+    std::printf("[BTN] GPIO thread exiting\n");
 }
-#endif // USE_GPIO_BUTTON
+#endif
 
 // ──────────────────────────────────────────────
 //  MAIN
@@ -512,14 +405,20 @@ int main(int argc, char* argv[])
 {
     const char* method = (argc > 1) ? argv[1] : "yinfast";
 
-    std::cout << "silent_jam v5  (v4 synth + recording)\n"
-              << "Pitch method   : " << method << "\n"
-              << "Analysis window: " << BUFFER_SIZE << " samples\n"
-              << "Hop size       : " << HOP_SIZE << " samples\n"
-              << "Sample rate    : " << SR << " Hz\n"
-              << "Glide time     : " << GLIDE_TIME_S * 1000.0f << " ms\n"
-              << "Breath mix     : " << BREATH_MIX << "\n\n";
+    std::cout << "silent_jam  (v5 synth + recording + pigpio button)\n"
+              << "Pitch method: " << method << "  |  SR: " << SR << " Hz\n\n";
 
+    // ── pigpio init ──
+#ifdef USE_GPIO_BUTTON
+    if (gpioInitialise() < 0) {
+        std::fprintf(stderr, "[BTN] pigpio init failed — run with sudo. Button disabled.\n");
+    } else {
+        std::printf("[BTN] pigpio OK\n");
+        std::thread(button_thread_fn).detach();
+    }
+#endif
+
+    // ── aubio ──
     pitch_obj = new_aubio_pitch(method, BUFFER_SIZE, HOP_SIZE, SR);
     if (!pitch_obj) { std::cerr << "Failed to create aubio pitch object\n"; return 1; }
     aubio_pitch_set_unit(pitch_obj, "Hz");
@@ -527,6 +426,7 @@ int main(int argc, char* argv[])
     in_buf    = new_fvec(BUFFER_SIZE);
     pitch_out = new_fvec(1);
 
+    // ── PortAudio ──
     PaError err = Pa_Initialize();
     if (err != paNoError) { std::cerr << Pa_GetErrorText(err) << "\n"; return 1; }
 
@@ -540,18 +440,6 @@ int main(int argc, char* argv[])
     }
     std::cout << "\nUsing input=" << INPUT_DEVICE << "  output=" << OUTPUT_DEVICE << "\n\n";
 
-    // ──────────────────────────────────────────
-    //  GPIO BUTTON — launch watcher thread (Pi)
-    // ──────────────────────────────────────────
-    // The thread blocks on GPIO17 edge events and sets
-    // g_button_toggle_requested on each clean press. The command loop polls
-    // that flag and calls toggle_recording() on this thread, so the WAV write
-    // never happens in the button thread's context.
-    // Built only with -DUSE_GPIO_BUTTON; otherwise console controls are used.
-#ifdef USE_GPIO_BUTTON
-    std::thread button_thread(button_thread_fn);
-#endif
-
     PaStreamParameters inParams{};
     inParams.device           = INPUT_DEVICE;
     inParams.channelCount     = 1;
@@ -559,9 +447,9 @@ int main(int argc, char* argv[])
     inParams.suggestedLatency = Pa_GetDeviceInfo(INPUT_DEVICE)->defaultLowInputLatency;
 
     PaStreamParameters outParams{};
-    outParams.device          = OUTPUT_DEVICE;
-    outParams.channelCount    = 2;
-    outParams.sampleFormat    = paFloat32;
+    outParams.device           = OUTPUT_DEVICE;
+    outParams.channelCount     = 2;
+    outParams.sampleFormat     = paFloat32;
     outParams.suggestedLatency = Pa_GetDeviceInfo(OUTPUT_DEVICE)->defaultLowOutputLatency;
 
     PaStream* inStream = nullptr, *outStream = nullptr;
@@ -571,82 +459,54 @@ int main(int argc, char* argv[])
     err = Pa_OpenStream(&outStream, nullptr,    &outParams, SR, HOP_SIZE, paClipOff, output_callback, nullptr);
     if (err != paNoError) { std::cerr << "Output: " << Pa_GetErrorText(err) << "\n"; Pa_CloseStream(inStream); Pa_Terminate(); return 1; }
 
-    const PaStreamInfo* inInfo  = Pa_GetStreamInfo(inStream);
-    const PaStreamInfo* outInfo = Pa_GetStreamInfo(outStream);
-    std::cout << "── Latency ──\n"
-              << "  Input  : " << inInfo->inputLatency   * 1000.0 << " ms\n"
-              << "  Output : " << outInfo->outputLatency * 1000.0 << " ms\n"
-              << "  Total  : " << (inInfo->inputLatency + outInfo->outputLatency) * 1000.0 << " ms\n\n";
-
+    g_recorded_chunks.resize(SR * 2 * 300);  // 5 min stereo pre-alloc
     Pa_StartStream(inStream);
     Pa_StartStream(outStream);
 
-    std::puts("Live monitoring is ON — you can hear yourself whether or not you're recording.");
-    std::puts("Controls (console fallback): 1 = start/stop recording | 0 = quit");
-    std::puts("(Physical button calls the same toggle_recording().)\n");
+    std::puts("Live monitoring ON. Press button or type '1' to start/stop recording. '0' to quit.\n");
 
     // ── Command loop ──
-    // Uses select() so we can poll both stdin AND the button flag without
-    // blocking. Telemetry prints here too.
     std::string line_buf;
     while (true) {
         if (g_telem_ready.load(std::memory_order_acquire)) {
             TelemSnapshot s = g_telem_snap;
             g_telem_ready.store(false, std::memory_order_release);
-            std::cout << "\n─────────────────────────────\n"
-                      << "  Avg level  : " << s.avg_db   << " dBFS\n"
-                      << "  Avg conf   : " << s.avg_conf << "\n"
-                      << "  Avg pitch  : " << s.avg_hz   << " Hz\n"
-                      << "  Gate open  : " << s.gate_pct << "%"
-                      << (g_is_recording.load() ? "   [REC ●]" : "")
-                      << "\n─────────────────────────────\n";
-            std::cout.flush();
+            std::printf("\n  Level: %.1f dBFS  Conf: %.2f  Pitch: %.1f Hz  Gate: %d%%%s\n",
+                        s.avg_db, s.avg_conf, s.avg_hz, s.gate_pct,
+                        g_is_recording.load() ? "  [REC ●]" : "");
+            std::fflush(stdout);
         }
 
-        // Physical button: the GPIO thread sets this flag on a clean press.
-        // We act on it here, on the normal thread, so the WAV save is safe.
+        // Button press → toggle recording (safe: file I/O on main thread)
         if (g_button_toggle_requested.exchange(false)) {
             toggle_recording();
         }
 
-#ifndef _WIN32
         fd_set fds; FD_ZERO(&fds); FD_SET(0, &fds);
-        struct timeval tv = {0, 10000};   // 10 ms poll
+        struct timeval tv = {0, 10000};
         if (select(1, &fds, nullptr, nullptr, &tv) > 0) {
-            if (!std::getline(std::cin, line_buf)) break;  // EOF
+            if (!std::getline(std::cin, line_buf)) break;
             if (line_buf == "1") {
                 toggle_recording();
             } else if (line_buf == "0") {
-                if (g_is_recording.load()) toggle_recording();  // stop+save first
+                if (g_is_recording.load()) toggle_recording();
                 std::puts("Goodbye!");
                 break;
-            } else if (!line_buf.empty()) {
-                std::puts("Unknown command. 1 = record | 0 = quit");
             }
         }
-#else
-        if (_kbhit()) {
-            int c = _getch();
-            if (c == '1') toggle_recording();
-            else if (c == '0') {
-                if (g_is_recording.load()) toggle_recording();
-                break;
-            }
-        }
-        Sleep(10);
-#endif
     }
 
-    // Tell the button thread to exit, then join it before tearing down audio.
     g_running.store(false);
-#ifdef USE_GPIO_BUTTON
-    if (button_thread.joinable()) button_thread.join();
-#endif
 
     Pa_StopStream(inStream);  Pa_StopStream(outStream);
     Pa_CloseStream(inStream); Pa_CloseStream(outStream);
     Pa_Terminate();
     del_aubio_pitch(pitch_obj); del_fvec(in_buf); del_fvec(pitch_out);
     aubio_cleanup();
+
+#ifdef USE_GPIO_BUTTON
+    gpioTerminate();
+#endif
+
     return 0;
 }
