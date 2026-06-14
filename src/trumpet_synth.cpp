@@ -117,14 +117,20 @@ struct InputState {
 };
 
 // ─────────────────────── WAVEFORM ─────────────────────────────────────────
-// Additive trumpet-ish timbre. Same partials as before.
+// Additive trumpet-ish timbre. Partial amplitudes sum to ~2.35 at peak, so we
+// divide by that sum to keep the waveform within roughly [-1, 1]. Without this
+// normalisation the signal slams into the tanh below and hard-clips into a
+// near-square wave — that was the source of the static/crackle, and the
+// phase-beating of the partials against the clipper caused the volume to waver.
+static constexpr double HARM_SUM = 1.00 + 0.60 + 0.35 + 0.20 + 0.12 + 0.08;
 static inline double trumpet_wave(double phase) {
-    return 1.00 * std::sin(phase)
-         + 0.60 * std::sin(2.0 * phase)
-         + 0.35 * std::sin(3.0 * phase)
-         + 0.20 * std::sin(4.0 * phase)
-         + 0.12 * std::sin(5.0 * phase)
-         + 0.08 * std::sin(6.0 * phase);
+    double v = 1.00 * std::sin(phase)
+             + 0.60 * std::sin(2.0 * phase)
+             + 0.35 * std::sin(3.0 * phase)
+             + 0.20 * std::sin(4.0 * phase)
+             + 0.12 * std::sin(5.0 * phase)
+             + 0.08 * std::sin(6.0 * phase);
+    return v / HARM_SUM;   // now in ~[-1, 1]
 }
 
 static double perf_counter() {
@@ -169,8 +175,10 @@ static int output_callback(
         // 4. Synthesise this sample.
         double sample = 0.0;
         if (st->current_freq > 1.0 && st->amplitude > 1e-4) {
-            sample = trumpet_wave(st->phase);
-            sample = std::tanh(sample * 2.2) * OUTPUT_LEVEL;   // shape + headroom
+            sample = trumpet_wave(st->phase);                  // ~[-1, 1]
+            // Gentle saturation for warmth + headroom. Drive kept low (1.0) so
+            // tanh only softens peaks instead of clipping the tone to a square.
+            sample = std::tanh(sample * 1.0) * OUTPUT_LEVEL;
             sample *= st->amplitude * st->dyn;                 // envelope + dynamics
 
             st->phase += two_pi * st->current_freq / SR;
