@@ -62,6 +62,8 @@
 #  define M_PI 3.14159265358979323846
 #endif
 
+
+
 // ─────────────────────────── SETTINGS ─────────────────────────────────────
 
 static constexpr int    SR          = 22050;
@@ -121,6 +123,8 @@ static inline void   set_target(double f){ g_target_freq.store(f, std::memory_or
 #ifdef USE_GPIO_BUTTON
 static std::atomic<int> g_gpio_seen{0};
 #endif
+
+
 
 // ─────────────────────── OUTPUT / INPUT STATE ─────────────────────────────
 struct OutputState {
@@ -357,6 +361,7 @@ static void button_thread_fn() {
 
 // ─────────────────────── MAIN ─────────────────────────────────────────────
 int main(int argc, char* argv[]) {
+    std::cout << "hellow world";
     const char* method = (argc > 1) ? argv[1] : "yinfast";
 
     // ── Initialise pigpio + launch button thread (Pi only) ────────────────
