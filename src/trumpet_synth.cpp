@@ -181,7 +181,7 @@ static int input_callback(
     static double cb_time = 0.0;
     cb_time += (double)HOP_SIZE / SR;
 
-    if (conf > CONF_THRESHOLD && pitch > 50.0f && pitch < 2000.0f) {
+    if (conf > CONF_THRESHOLD && pitch > 0 && pitch < 2000.0f) {
         g_last_pitch.store((double)pitch, std::memory_order_relaxed);
         g_last_good_ts.store(cb_time,     std::memory_order_relaxed);
     }
