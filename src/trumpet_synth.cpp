@@ -118,6 +118,10 @@ static std::atomic<double> g_dyn_gain   {1.0};   // 0..1 smoothed loudness
 static inline double get_target()        { return g_target_freq.load(std::memory_order_relaxed); }
 static inline void   set_target(double f){ g_target_freq.store(f, std::memory_order_relaxed); }
 
+#ifdef USE_GPIO_BUTTON
+static std::atomic<int> g_gpio_seen{0};
+#endif
+
 // ─────────────────────── OUTPUT / INPUT STATE ─────────────────────────────
 struct OutputState {
     double phase        = 0.0;
@@ -314,29 +318,40 @@ static int input_callback(
 #ifdef USE_GPIO_BUTTON
 static void button_thread_fn() {
     gpioSetMode(BUTTON_PIN, PI_INPUT);
-    gpioSetPullUpDown(BUTTON_PIN, PI_PUD_UP);   // idle HIGH, press pulls LOW
+    gpioSetPullUpDown(BUTTON_PIN, PI_PUD_UP);   // idle HIGH, press LOW
 
-    bool previous = true;   // pulled-up idle state
+    bool previous = gpioRead(BUTTON_PIN);
     double last_press = 0.0;
+
+    std::printf("[BTN] GPIO thread started on pin %d\n", BUTTON_PIN);
+    std::fflush(stdout);
 
     while (g_running.load()) {
         bool current = gpioRead(BUTTON_PIN);
 
-        // HIGH -> LOW transition = press
+        // debug heartbeat (proves thread is alive)
+        g_gpio_seen++;
+
         if (previous && !current) {
             double now = perf_counter();
+
             if ((now - last_press) * 1000.0 >= BUTTON_DEBOUNCE_MS) {
                 last_press = now;
+
                 bool new_state = !g_toggle_state.load();
                 g_toggle_state.store(new_state);
-                std::printf("\n[BTN] Button pressed — toggle is now %s\n",
+
+                std::printf("[BTN] PRESS detected → toggle = %s\n",
                             new_state ? "ON" : "OFF");
                 std::fflush(stdout);
             }
         }
+
         previous = current;
-        usleep(5000);   // 5 ms poll
+        usleep(5000); // 5ms polling
     }
+
+    std::printf("[BTN] GPIO thread exiting\n");
 }
 #endif
 
@@ -347,10 +362,14 @@ int main(int argc, char* argv[]) {
     // ── Initialise pigpio + launch button thread (Pi only) ────────────────
 #ifdef USE_GPIO_BUTTON
     bool gpio_ok = (gpioInitialise() >= 0);
+
     if (!gpio_ok) {
-        std::fprintf(stderr, "[BTN] Failed to initialise pigpio — button "
-                             "disabled. (Run with sudo.) Audio will still run.\n");
+        std::fprintf(stderr,
+            "[BTN] pigpio failed to init. Run with sudo.\n");
+    } else {
+        std::printf("[BTN] pigpio OK\n");
     }
+
     std::thread button_thread;
     if (gpio_ok) button_thread = std::thread(button_thread_fn);
 #endif
@@ -369,12 +388,14 @@ int main(int argc, char* argv[]) {
     aubio_pitch_set_silence(in_state.pitch_obj, -40.0f);
 
     OutputState out_state;
-
+    /*
     std::printf("Silent Jam (lean)\n");
     std::printf("  Sample rate   : %d Hz\n", SR);
     std::printf("  Analysis win  : %d samples\n", BUFFER_SIZE);
     std::printf("  Hop / out blk : %d / %d samples\n", HOP_SIZE, OUT_BLOCK);
     std::printf("  Pitch method  : %s\n\n", method);
+
+    */
 
     int nd = Pa_GetDeviceCount();
     std::printf("── Audio devices ──\n");
