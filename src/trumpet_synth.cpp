@@ -26,15 +26,15 @@
 // ──────────────────────────────────────────────
 //  SETTINGS
 // ──────────────────────────────────────────────
-static constexpr int    SR            = 22050;
-static constexpr int    BUFFER_SIZE   = 128;
-static constexpr int    HOP_SIZE      = 64;
+static constexpr int    SR            = 44100;
+static constexpr int    BUFFER_SIZE   = 256;
+static constexpr int    HOP_SIZE      = 128;
 static constexpr int    INPUT_DEVICE  = 1;
-static constexpr int    OUTPUT_DEVICE = 8;
+static constexpr int    OUTPUT_DEVICE = 0;
 
 static constexpr double CONF_THRESHOLD      = 0.5;
 static constexpr double PLAY_CONF_THRESHOLD = 0.8;
-static constexpr double PLAY_LEVEL_DB       = -30.0;
+static constexpr double PLAY_LEVEL_DB       = -25.0;
 static constexpr double HOLD_TIME           = 0.05;
 static constexpr int    TELEM_INTERVAL      = 100;
 
