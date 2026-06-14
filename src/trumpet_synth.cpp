@@ -417,7 +417,7 @@ static void button_thread_fn() {
 // ──────────────────────────────────────────────
 int main(int argc, char* argv[])
 {
-    const char* method = (argc > 1) ? argv[1] : "schmitt";
+    const char* method = (argc > 1) ? argv[1] : "yinfast";
 
     std::cout << "silent_jam  (v5 synth + recording + pigpio button)\n"
               << "Pitch method: " << method << "  |  SR: " << SR << " Hz\n\n";
