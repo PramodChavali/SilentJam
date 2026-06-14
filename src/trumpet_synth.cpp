@@ -67,7 +67,7 @@ static constexpr float  OUTPUT_GAIN         = 0.30f;
 static constexpr float  BREATH_MIX          = 0.06f;
 static constexpr float  GLIDE_TIME_S        = 0.012f;
 static constexpr float  ENV_ATTACK_S        = 0.004f;
-static constexpr float  ENV_RELEASE_S       = 0.060f;
+static constexpr float  ENV_RELEASE_S       = 0.120f;
 
 // Dynamics
 static constexpr float  DYN_SMOOTH_S        = 0.150f;
