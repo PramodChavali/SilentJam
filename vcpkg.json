@@ -1,0 +1,11 @@
+{
+  "name": "trumpet-synth",
+  "version": "1.0.0",
+  "dependencies": [
+    {
+      "name": "aubio",
+      "default-features": false
+    },
+    "portaudio"
+  ]
+}

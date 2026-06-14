@@ -1,0 +1,13 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <CustomBuild Include="C:\Users\Pramo\Desktop\Projects\JamSilent_(C++)\build\CMakeFiles\ca3857c540848356ed37c213a2d81eb8\generate.stamp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="CMake Rules">
+      <UniqueIdentifier>{9BC05762-8310-302F-8306-9CA8E9D41400}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

@@ -1,0 +1,6 @@
+{
+  "cmake.configureArgs": [
+    "-DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake"
+],
+"C_Cpp.default.compilerPath": "C:/msys64/ucrt64/bin/gcc.exe"
+}

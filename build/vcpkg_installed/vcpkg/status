@@ -1,0 +1,35 @@
+Package: vcpkg-cmake-config
+Version: 2024-05-23
+Architecture: x64-windows
+Multi-Arch: same
+Abi: b1499092568c4a08c9e29546a8400daf4256332405f9333362a618c0c49fb5c3
+Status: install ok installed
+
+Package: vcpkg-cmake
+Version: 2024-04-23
+Architecture: x64-windows
+Multi-Arch: same
+Abi: 075b42f4a232f80fecd66b7544d4d4bf9d5662a02ec3da42e485b4c83b07c53d
+Status: install ok installed
+
+Package: aubio
+Version: 2024-01-03
+Port-Version: 1
+Depends: vcpkg-cmake, vcpkg-cmake-config
+Architecture: x64-windows
+Multi-Arch: same
+Abi: 9934741e74027c8cb9085c2c000371252c6546418536320073960c071445cc54
+Description: Aubio is a tool designed for the extraction of annotations from audio signals. Its features include segmenting a sound file before each of its attacks, performing pitch detection, tapping the beat and producing midi streams from live audio.
+Default-Features: tools
+Status: install ok installed
+
+Package: portaudio
+Version: 19.7
+Port-Version: 9
+Depends: vcpkg-cmake, vcpkg-cmake-config
+Architecture: x64-windows
+Multi-Arch: same
+Abi: dc6c7afdb9c0fd4f2764b61adc80c2449d4edee4275498ce7aea0897ecfe333f
+Description: PortAudio Portable Cross-platform Audio I/O API PortAudio is a free, cross-platform, open-source, audio I/O library.  It lets you write simple audio programs in 'C' or C++ that will compile and run on many platforms including Windows, Macintosh OS X, and Unix (OSS/ALSA). It is intended to promote the exchange of audio software between developers on different platforms. Many applications use PortAudio for Audio I/O.
+Status: install ok installed
+

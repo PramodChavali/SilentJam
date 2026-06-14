@@ -1,0 +1,3 @@
+C:/Users/Pramo/Desktop/Projects/JamSilent_(C++)/build/CMakeFiles/trumpet_synth.dir
+C:/Users/Pramo/Desktop/Projects/JamSilent_(C++)/build/CMakeFiles/ALL_BUILD.dir
+C:/Users/Pramo/Desktop/Projects/JamSilent_(C++)/build/CMakeFiles/ZERO_CHECK.dir

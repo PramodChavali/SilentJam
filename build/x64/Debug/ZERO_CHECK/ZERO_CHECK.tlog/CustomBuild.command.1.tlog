@@ -1,0 +1,10 @@
+^C:\USERS\PRAMO\DESKTOP\PROJECTS\JAMSILENT_(C++)\BUILD\CMAKEFILES\CA3857C540848356ED37C213A2D81EB8\GENERATE.STAMP.RULE
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SC:/Users/Pramo/Desktop/Projects/JamSilent_(C++) -BC:/Users/Pramo/Desktop/Projects/JamSilent_(C++)/build --check-stamp-list CMakeFiles/generate.stamp.list --vs-solution-file C:/Users/Pramo/Desktop/Projects/JamSilent_(C++)/build/trumpet_synth.sln
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
