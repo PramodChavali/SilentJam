@@ -48,6 +48,15 @@
 #include <cstring>
 #include <iostream>
 #include <string>
+#include <thread>
+
+// GPIO button support (Raspberry Pi, pigpio). Build with -DUSE_GPIO_BUTTON and
+// link -lpigpio -lrt -lpthread. Without the flag, the button code is excluded
+// so the file still builds on non-Pi machines.
+#ifdef USE_GPIO_BUTTON
+#  include <pigpio.h>
+#  include <unistd.h>
+#endif
 
 #ifndef M_PI
 #  define M_PI 3.14159265358979323846
@@ -64,6 +73,15 @@ static constexpr int    OUT_BLOCK   = 128;   // output block — matched to hop 
 
 static constexpr int    INPUT_DEVICE  = 1;   // adjust to your USB mic index
 static constexpr int    OUTPUT_DEVICE = 0;   // adjust to your headphone index
+
+// ─────────────────────── BUTTON ───────────────────────────────────────────
+static constexpr int    BUTTON_PIN     = 16;   // BCM GPIO16 (physical pin 36)
+static constexpr int    BUTTON_DEBOUNCE_MS = 200; // ignore re-presses within this
+
+// The boolean the button toggles. Atomic so the audio/main threads can read it
+// safely later (e.g. to gate recording). For now it just flips and prints.
+static std::atomic<bool> g_toggle_state{false};
+static std::atomic<bool> g_running{true};   // tells the button thread to exit
 
 // ─────────────────────── TUNABLE THRESHOLDS ───────────────────────────────
 
@@ -289,9 +307,53 @@ static int input_callback(
     return paContinue;
 }
 
+// ─────────────────────── BUTTON THREAD (pigpio) ───────────────────────────
+// Polls GPIO16 with the internal pull-up (press = HIGH->LOW). On each clean
+// press it toggles g_toggle_state and prints the new status. Runs in its own
+// thread so it never blocks the audio. Excluded unless -DUSE_GPIO_BUTTON.
+#ifdef USE_GPIO_BUTTON
+static void button_thread_fn() {
+    gpioSetMode(BUTTON_PIN, PI_INPUT);
+    gpioSetPullUpDown(BUTTON_PIN, PI_PUD_UP);   // idle HIGH, press pulls LOW
+
+    bool previous = true;   // pulled-up idle state
+    double last_press = 0.0;
+
+    while (g_running.load()) {
+        bool current = gpioRead(BUTTON_PIN);
+
+        // HIGH -> LOW transition = press
+        if (previous && !current) {
+            double now = perf_counter();
+            if ((now - last_press) * 1000.0 >= BUTTON_DEBOUNCE_MS) {
+                last_press = now;
+                bool new_state = !g_toggle_state.load();
+                g_toggle_state.store(new_state);
+                std::printf("\n[BTN] Button pressed — toggle is now %s\n",
+                            new_state ? "ON" : "OFF");
+                std::fflush(stdout);
+            }
+        }
+        previous = current;
+        usleep(5000);   // 5 ms poll
+    }
+}
+#endif
+
 // ─────────────────────── MAIN ─────────────────────────────────────────────
 int main(int argc, char* argv[]) {
     const char* method = (argc > 1) ? argv[1] : "yinfast";
+
+    // ── Initialise pigpio + launch button thread (Pi only) ────────────────
+#ifdef USE_GPIO_BUTTON
+    bool gpio_ok = (gpioInitialise() >= 0);
+    if (!gpio_ok) {
+        std::fprintf(stderr, "[BTN] Failed to initialise pigpio — button "
+                             "disabled. (Run with sudo.) Audio will still run.\n");
+    }
+    std::thread button_thread;
+    if (gpio_ok) button_thread = std::thread(button_thread_fn);
+#endif
 
     PaError err = Pa_Initialize();
     if (err != paNoError) {
@@ -370,5 +432,13 @@ int main(int argc, char* argv[]) {
     del_fvec(in_state.in_buf);
     del_fvec(in_state.out_buf);
     aubio_cleanup();
+
+    // ── Stop button thread + pigpio ──
+#ifdef USE_GPIO_BUTTON
+    g_running.store(false);
+    if (button_thread.joinable()) button_thread.join();
+    if (gpio_ok) gpioTerminate();
+#endif
+
     return 0;
 }
