@@ -47,7 +47,7 @@
 // ──────────────────────────────────────────────
 //  SETTINGS
 // ──────────────────────────────────────────────
-static constexpr int    SR            = 22050;
+static constexpr int    SR            = 44100;
 static constexpr int    BUFFER_SIZE   = 1024;
 static constexpr int    HOP_SIZE      = 128;
 static constexpr int    INPUT_DEVICE  = 1;   // USB PnP mic
