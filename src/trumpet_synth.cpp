@@ -40,10 +40,14 @@
 #include <ctime>
 #include <filesystem>
 #include <iostream>
-#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
+#include <atomic>
+
+#include <sys/select.h>
+#include <sys/time.h>
+#include <unistd.h>
 
 // GPIO button support (Raspberry Pi). Compile with -DUSE_GPIO_BUTTON and link
 // against libgpiod (-lgpiod). On non-Pi builds, leave the flag off and the
@@ -59,14 +63,14 @@
 // ──────────────────────────────────────────────
 //  SETTINGS — tune these on the Pi  (kept from v4)
 // ──────────────────────────────────────────────
-static constexpr int    SR            = 44100;
+static constexpr int    SR            = 22050;
 static constexpr int    BUFFER_SIZE   = 1024;   // analysis window — 1024 keeps the
                                                 // low-note fix (musical floor ~85 Hz,
                                                 // an octave below any trumpet note)
                                                 // while halving onset lag vs 2048
 static constexpr int    HOP_SIZE      = 128;    // keep small for latency
-static constexpr int    INPUT_DEVICE  = 1;
-static constexpr int    OUTPUT_DEVICE = 0;
+static constexpr int    INPUT_DEVICE  = 0;
+static constexpr int    OUTPUT_DEVICE = 1;
 
 // GPIO button (Raspberry Pi). Button wired across 3.3V and GPIO17; internal
 // pull-down enabled in software, so press = HIGH, rising edge = toggle record.
@@ -118,8 +122,8 @@ static std::atomic<double> g_last_pitch   {0.0};
 // g_recorded_chunks is appended under a mutex; the callback only locks briefly
 // to push the block it just synthesised. Saving happens off the audio thread.
 static std::atomic<bool>   g_is_recording{false};
-static std::mutex          g_chunks_mutex;
-static std::vector<float>  g_recorded_chunks;   // mono, one sample per frame
+static std::vector<float>  g_recorded_chunks;
+static std::atomic<size_t> g_rec_write_pos{0};
 
 // Set by the GPIO button thread on a clean press; the main loop polls it and
 // calls toggle_recording() on the normal thread (so file I/O never runs inside
@@ -207,12 +211,10 @@ static void save_recording();
 //   inside the ISR. Instead, set a flag (e.g. g_save_requested) in the ISR and
 //   let the main loop notice it and call save_recording(). See the BUTTON HOOK
 //   block in main() for the recommended pattern.
+
 static void toggle_recording() {
     if (!g_is_recording.load()) {
-        {
-            std::lock_guard<std::mutex> lk(g_chunks_mutex);
-            g_recorded_chunks.clear();
-        }
+        g_rec_write_pos.store(0, std::memory_order_relaxed);
         g_is_recording.store(true);
         std::puts("\n[REC] Recording started...");
     } else {
@@ -223,24 +225,15 @@ static void toggle_recording() {
 }
 
 static void save_recording() {
-    std::vector<float> audio;
-    {
-        std::lock_guard<std::mutex> lk(g_chunks_mutex);
-        audio = g_recorded_chunks;  // copy out, release lock
-    }
+    size_t len = g_rec_write_pos.load(std::memory_order_relaxed);
 
-    if (audio.empty()) {
+    if (len == 0) {
         std::puts("[REC] Nothing to save.");
         return;
     }
 
-    // Normalise to 95% of full scale
-    float peak = 0.0f;
-    for (float s : audio) peak = std::max(peak, std::fabs(s));
-    if (peak > 0.0f) {
-        float scale = 0.95f / peak;
-        for (float& s : audio) s *= scale;
-    }
+    std::vector<float> audio(g_recorded_chunks.begin(),
+                             g_recorded_chunks.begin() + len);
 
     std::filesystem::create_directories("recordings");
     std::time_t now_t = std::time(nullptr);
@@ -250,7 +243,7 @@ static void save_recording() {
 
     SF_INFO sfinfo{};
     sfinfo.samplerate = SR;
-    sfinfo.channels   = 1;                                  // mono
+    sfinfo.channels   = 2;
     sfinfo.format     = SF_FORMAT_WAV | SF_FORMAT_FLOAT;
 
     SNDFILE* sf = sf_open(filename.c_str(), SFM_WRITE, &sfinfo);
@@ -259,11 +252,13 @@ static void save_recording() {
                      filename.c_str(), sf_strerror(nullptr));
         return;
     }
-    sf_writef_float(sf, audio.data(), static_cast<sf_count_t>(audio.size()));
+    sf_writef_float(sf, audio.data(), (sf_count_t)(len / 2));
     sf_close(sf);
 
     std::printf("[REC] Saved: %s  (%.1f s)\n",
-                filename.c_str(), (double)audio.size() / SR);
+                filename.c_str(), (double)(len / 2) / SR);
+
+    g_rec_write_pos.store(0, std::memory_order_relaxed);
 }
 
 // ──────────────────────────────────────────────
@@ -377,11 +372,6 @@ static int output_callback(
     // Capture the mono signal for recording as we generate it. Both output
     // channels are identical, so we store one sample per frame.
     const bool recording = g_is_recording.load(std::memory_order_relaxed);
-    static std::vector<float> rec_scratch;   // reused; avoids per-callback alloc
-    if (recording) {
-        rec_scratch.clear();
-        rec_scratch.reserve(framesPerBuffer);
-    }
 
     bool playing = (target_freq > 0.0f);
 
@@ -427,15 +417,15 @@ static int output_callback(
         out[2 * i]     = sample;
         out[2 * i + 1] = sample;
 
-        if (recording) rec_scratch.push_back(sample);
-    }
-
-    // Push this block into the recording buffer under the mutex. Kept outside
-    // the per-sample loop so we lock once per callback, not once per sample.
-    if (recording && !rec_scratch.empty()) {
-        std::lock_guard<std::mutex> lk(g_chunks_mutex);
-        g_recorded_chunks.insert(g_recorded_chunks.end(),
-                                 rec_scratch.begin(), rec_scratch.end());
+// Record exactly what went to headphones
+        if (recording) {
+            size_t pos = g_rec_write_pos.load(std::memory_order_relaxed);
+            if (pos + 2 <= g_recorded_chunks.size()) {
+                g_recorded_chunks[pos]     = sample;
+                g_recorded_chunks[pos + 1] = sample;
+                g_rec_write_pos.store(pos + 2, std::memory_order_relaxed);
+            }
+        }
     }
 
     return paContinue;
@@ -531,12 +521,12 @@ int main(int argc, char* argv[])
     if (err != paNoError) { std::cerr << Pa_GetErrorText(err) << "\n"; return 1; }
 
     int nd = Pa_GetDeviceCount();
-    std::cout << "── Audio devices ──\n";
-    for (int i = 0; i < nd; ++i) {
-        const PaDeviceInfo* d = Pa_GetDeviceInfo(i);
-        std::cout << "  [" << i << "] " << d->name
-                  << "  in=" << d->maxInputChannels
-                  << "  out=" << d->maxOutputChannels << "\n";
+        std::cout << "── Audio devices ──\n";
+        for (int i = 0; i < nd; ++i) {
+            const PaDeviceInfo* d = Pa_GetDeviceInfo(i);
+            std::cout << "  [" << i << "] " << d->name
+                    << "  in=" << d->maxInputChannels
+                    << "  out=" << d->maxOutputChannels << "\n";
     }
     std::cout << "\nUsing input=" << INPUT_DEVICE << "  output=" << OUTPUT_DEVICE << "\n\n";
 
@@ -578,6 +568,7 @@ int main(int argc, char* argv[])
               << "  Output : " << outInfo->outputLatency * 1000.0 << " ms\n"
               << "  Total  : " << (inInfo->inputLatency + outInfo->outputLatency) * 1000.0 << " ms\n\n";
 
+    g_recorded_chunks.resize(SR * 2 * 300);  // pre-allocate 5 min stereo
     Pa_StartStream(inStream);
     Pa_StartStream(outStream);
 
