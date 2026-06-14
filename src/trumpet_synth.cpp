@@ -52,7 +52,10 @@
 //  SETTINGS — tune these on the Pi  (kept from v4)
 // ──────────────────────────────────────────────
 static constexpr int    SR            = 44100;
-static constexpr int    BUFFER_SIZE   = 2048;   // analysis window (low-note fix)
+static constexpr int    BUFFER_SIZE   = 1024;   // analysis window — 1024 keeps the
+                                                // low-note fix (musical floor ~85 Hz,
+                                                // an octave below any trumpet note)
+                                                // while halving onset lag vs 2048
 static constexpr int    HOP_SIZE      = 128;    // keep small for latency
 static constexpr int    INPUT_DEVICE  = 1;
 static constexpr int    OUTPUT_DEVICE = 0;
@@ -70,6 +73,18 @@ static constexpr float  GLIDE_TIME_S        = 0.012f;
 static constexpr float  ENV_ATTACK_S        = 0.004f;
 static constexpr float  ENV_RELEASE_S       = 0.060f;
 
+// Dynamics — output loudness follows how hard you play, based on input dB.
+// The input level is smoothed slowly (DYN_SMOOTH_S) so the volume tracks your
+// breath, not the mic's per-sample jitter, keeping the tone consistent.
+//   DYN_DB_SOFT  : input dB mapped to the quietest output (DYN_GAIN_MIN)
+//   DYN_DB_LOUD  : input dB mapped to full output (1.0)
+//   DYN_GAIN_MIN : floor gain so soft notes stay clean & present, never vanish
+// Set DYN_GAIN_MIN = 1.0f to disable dynamics (constant volume).
+static constexpr float  DYN_SMOOTH_S        = 0.150f;  // 150 ms loudness tracking
+static constexpr float  DYN_DB_SOFT         = -30.0f;  // soft playing level (dBFS)
+static constexpr float  DYN_DB_LOUD         = -8.0f;   // loud playing level (dBFS)
+static constexpr float  DYN_GAIN_MIN        = 0.40f;   // floor: softest = 40% vol
+
 // Telemetry
 static constexpr int    TELEM_INTERVAL      = 100;
 
@@ -78,6 +93,7 @@ static constexpr int    TELEM_INTERVAL      = 100;
 // ──────────────────────────────────────────────
 static std::atomic<float>  g_freq         {0.0f};
 static std::atomic<float>  g_rms_lin      {0.0f};
+static std::atomic<float>  g_dyn_gain     {1.0f};   // smoothed loudness 0..1 (dynamics)
 static std::atomic<double> g_last_good_ts {0.0};
 static std::atomic<double> g_last_pitch   {0.0};
 
@@ -264,6 +280,19 @@ static int input_callback(
     env_rms = alpha * rms_lin + (1.0f - alpha) * env_rms;
     g_rms_lin.store(env_rms, std::memory_order_relaxed);
 
+    // Dynamics: slowly smooth the input dB, map it to an output gain in
+    // [DYN_GAIN_MIN, 1.0]. Slow smoothing is what keeps the resulting volume
+    // steady instead of chasing the mic's jitter. Hop-rate one-pole, so the
+    // coefficient is per-hop (HOP_SIZE samples), not per-sample.
+    static float dyn_db = DYN_DB_SOFT;
+    static const float dyn_alpha =
+        1.0f - expf(-1.0f / (DYN_SMOOTH_S * (float)SR / (float)HOP_SIZE));
+    dyn_db += dyn_alpha * (db - dyn_db);
+    float dyn_t    = (dyn_db - DYN_DB_SOFT) / (DYN_DB_LOUD - DYN_DB_SOFT);
+    dyn_t          = std::max(0.0f, std::min(1.0f, dyn_t));
+    float dyn_gain = DYN_GAIN_MIN + (1.0f - DYN_GAIN_MIN) * dyn_t;
+    g_dyn_gain.store(dyn_gain, std::memory_order_relaxed);
+
     static double cb_time = 0.0;
     cb_time += (double)HOP_SIZE / SR;
 
@@ -308,10 +337,13 @@ static int output_callback(
     float* out = static_cast<float*>(outputBuffer);
 
     float target_freq = g_freq.load(std::memory_order_relaxed);
-    float rms         = g_rms_lin.load(std::memory_order_relaxed);
+    float dyn_gain    = g_dyn_gain.load(std::memory_order_relaxed);  // 0..1 loudness
+    // (input RMS is still tracked on the input side for telemetry; output level
+    //  is the fixed envelope below, scaled by the smoothed dynamics gain.)
 
     static float phases[N_HARM]   = {};
     static float cur_freq         = 0.0f;
+    static float env_dyn          = 1.0f;   // per-sample-smoothed dynamics gain
     static float env_amp          = 0.0f;
     static float cached_freq      = 0.0f;
     static float harm[N_HARM]     = {};
@@ -339,9 +371,17 @@ static int output_callback(
             cur_freq += glide_alpha * (target_freq - cur_freq);
         }
 
-        float amp_target = playing ? std::max(0.01f, rms * 8.0f) : 0.0f;
+        // On/off envelope: a smooth attack/release gate so notes start and stop
+        // click-free. The sustained LEVEL is constant (1.0) — loudness comes from
+        // the dynamics gain below, not from chasing the noisy input amplitude.
+        float amp_target = playing ? 1.0f : 0.0f;
         float amp_alpha  = (amp_target > env_amp) ? amp_alpha_a : amp_alpha_r;
         env_amp += amp_alpha * (amp_target - env_amp);
+
+        // Dynamics: glide the loudness gain toward the value the input side set.
+        // Already slow-smoothed there; this extra per-sample glide just removes
+        // any block-rate stepping so swells are perfectly smooth.
+        env_dyn += amp_alpha_r * (dyn_gain - env_dyn);
 
         if (fabsf(cur_freq - cached_freq) > cached_freq * 0.03f + 1.0f) {
             harm_amps(cur_freq, harm);
@@ -354,13 +394,13 @@ static int output_callback(
             for (int k = 0; k < N_HARM; ++k) {
                 if ((k + 1) * cur_freq >= (float)SR * 0.45f) break;
                 phases[k] += (float)(k + 1) * phase_inc_fund;
-                if (phases[k] > (float)M_PI) phases[k] -= 2.0f * (float)M_PI;
+                if (phases[k] > 2.0f * (float)M_PI) phases[k] -= 2.0f * (float)M_PI;
                 sample += harm[k] * sinf(phases[k]);
             }
         }
 
         sample += bp.process(white_noise()) * BREATH_MIX * env_amp;
-        sample *= env_amp * OUTPUT_GAIN;
+        sample *= env_amp * env_dyn * OUTPUT_GAIN;
         sample  = tanhf(sample * 0.8f) / 0.8f;
 
         out[2 * i]     = sample;
