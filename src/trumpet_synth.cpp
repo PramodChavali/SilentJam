@@ -50,8 +50,8 @@
 static constexpr int    SR            = 22050;
 static constexpr int    BUFFER_SIZE   = 1024;
 static constexpr int    HOP_SIZE      = 128;
-static constexpr int    INPUT_DEVICE  = 0;
-static constexpr int    OUTPUT_DEVICE = 1;
+static constexpr int    INPUT_DEVICE  = 1;   // USB PnP mic
+static constexpr int    OUTPUT_DEVICE = 0;   // bcm2835 headphones
 
 static constexpr int    BUTTON_PIN         = 16;   // BCM GPIO16 (physical pin 36)
 static constexpr int    BUTTON_DEBOUNCE_MS = 200;
